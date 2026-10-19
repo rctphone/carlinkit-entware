@@ -105,6 +105,20 @@ log_mark_user=$(wc -l 2>/dev/null < "$R/tmp/ttyLog" || echo 0)
     echo "  'Still not connect to AppServer' lines: $(grep -ac 'Still not connect to AppServer' "$R/tmp/ttyLog" 2>/dev/null)"
     grep -aiE 'fakeiOS|carplay|iap2|AppServer|HU |head ?unit|connect|error|fail|timeout' "$R/tmp/ttyLog" 2>/dev/null |
         grep -av -e 'check_log_size' -e 'Still not connect to AppServer' | tail -n 40 | redact | sed 's/^/  /'
+    echo
+    echo "== video (vendor log: fakeiOSDevice, AppleCarPlay, ARMadb-driver)"
+    # Glitch counters: decoder back-pressure from the car, late phone frames, keyframe
+    # requests the box ignored vs. served, frame cache overflow, SPS/PPS change restarts.
+    for m in 'HU video decoder busy' 'Late frame' 'ForceKeyFrame ignore it!' '###ForceKeyFrame VideoConfig!' \
+             'Need Keyframe!' 'Frame Cache too much' 'spspps is different'; do
+        printf '  %-32s %s\n' "$m:" "$(grep -acF "$m" "$R/tmp/ttyLog" 2>/dev/null)"
+    done
+    # Negotiated size and fps (car Open, what the iPhone was told, the custom fps override),
+    # then the periodic rate lines (fakeiOSDevice encrypt bitrate/cpu, ARMadb-driver 10 s rates).
+    for m in 'Open!!! size=' 'screenFps(' 'Registered screen' 'use custom FPS' 'Video Latency'; do
+        grep -aF "$m" "$R/tmp/ttyLog" 2>/dev/null | tail -n 3
+    done | sed 's/^/  /'
+    grep -aE 'video framerate: |box video frame rate: ' "$R/tmp/ttyLog" 2>/dev/null | tail -n 12 | sed 's/^/  /'
 } > summary.txt 2>&1
 
 # ---------- kernel ----------
