@@ -58,7 +58,7 @@ grab_redacted() {
 procs='fakeiOSDevice AppleCarPlay ARMiPhoneIAP2 ARMadb-driver bluetoothDaemon hcid hfpd dbus-daemon mdnsd hostapd udhcpd adbd boa colorLightDaemon riddle_top u2w-mfid mfid dropbear syslogd'
 
 log_mark_dmesg=$(dmesg 2>/dev/null | wc -l)
-log_mark_user=$(wc -l < "$R/tmp/ttyLog" 2>/dev/null || echo 0)
+log_mark_user=$(wc -l 2>/dev/null < "$R/tmp/ttyLog" || echo 0)
 
 # ---------- summary ----------
 {
@@ -131,7 +131,7 @@ grab logs/u2w-gadget-trace.log "$R/data/u2w-gadget-trace.log" 2000
 run proc/ps.txt ps w
 run proc/top.txt top -b -n 1
 for d in /proc/[0-9]*; do
-    read -r s < "$d/stat" 2>/dev/null || continue
+    read -r s 2>/dev/null < "$d/stat" || continue
     set -- $s
     echo "$1 ${2} utime=${14} stime=${15} threads=${20}"
 done > proc/cpu-ticks.txt

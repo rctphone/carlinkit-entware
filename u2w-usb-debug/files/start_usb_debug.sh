@@ -21,9 +21,9 @@ ADBD=${USB_DEBUG_ADBD:-/usr/sbin/adbd}
 verified=' '
 alive() {
     [ -s "$1" ] || return 1
-    read -r p < "$1" 2>/dev/null || return 1
+    read -r p 2>/dev/null < "$1" || return 1
     case "$p" in ''|*[!0-9]*) return 1;; esac
-    read -r stat < /proc/"$p"/stat 2>/dev/null || return 1
+    read -r stat 2>/dev/null < /proc/"$p"/stat || return 1
     set -- "$1" "$2" $stat
     st=${24}
     token="$p:$st|$2"
@@ -122,13 +122,13 @@ while :; do
     # Fast path: the configured interface still exists with the same ifindex.
     iface=
     if [ -n "$previous" ]; then
-        read -r idx < "$SYS/class/net/${previous%%:*}/ifindex" 2>/dev/null &&
+        read -r idx 2>/dev/null < "$SYS/class/net/${previous%%:*}/ifindex" &&
             [ "${previous%%:*}:$idx" = "$previous" ] && iface=${previous%%:*}
     fi
     [ -n "$iface" ] || iface=$(find_iface)
     if [ -n "$iface" ]; then
         idx=
-        read -r idx < "$SYS/class/net/$iface/ifindex" 2>/dev/null
+        read -r idx 2>/dev/null < "$SYS/class/net/$iface/ifindex"
         generation=$iface:$idx
         # The address is re-checked on a new interface and every 6th pass (~30 s).
         pass=$(( (pass + 1) % 6 ))
