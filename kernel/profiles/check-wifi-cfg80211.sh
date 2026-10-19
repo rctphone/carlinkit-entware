@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Verify the wifi-cfg80211 profile's 88x2bs.ko without loading it. Runs inside u2w-builder:
 #   docker run --rm -v "$PWD:/work:ro" -v u2w-kernel-cache:/kernel-cache:ro u2w-builder \
-#     bash /work/kernel/profiles/check-wifi-cfg80211.sh
+#     bash /work/work/carlinkit-entware/kernel/profiles/check-wifi-cfg80211.sh
 set -euo pipefail
-version=$(python3 -c 'import json;print(json.load(open("/work/sources.lock.json"))["kernel_version"])')
+version=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["kernel_version"])' "$(dirname "$0")/../sources.lock.json")
 ko=drivers/net/wireless/rtl8822bs/88x2bs.ko
 new=/kernel-cache/build/kernel-$version-wifi-cfg80211/$ko
 base=/kernel-cache/build/kernel-$version/$ko

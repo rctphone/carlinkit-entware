@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # Verify the usb-dev kernel profile without building or flashing a kernel.
-# Runs inside u2w-builder with the repo mounted read-only at /work and the kernel cache at /kernel-cache.
+# Runs inside u2w-builder with u2w-build mounted read-only at /work (this repository checked out at
+# work/carlinkit-entware) and the kernel cache at /kernel-cache. KERNEL_BUNDLE is the ludwig-v Kernel/ dir.
 #   docker run --rm -v "$PWD:/work:ro" -v u2w-kernel-cache:/kernel-cache:ro u2w-builder \
-#     bash /work/kernel/profiles/check-usb-dev.sh
+#     bash /work/work/carlinkit-entware/kernel/profiles/check-usb-dev.sh
 set -euo pipefail
-version=$(python3 -c 'import json;print(json.load(open("/work/sources.lock.json"))["kernel_version"])')
+profiles=$(cd "$(dirname "$0")" && pwd)
+bundle=${KERNEL_BUNDLE:-/work/work/kernel-upstream/Kernel}
+version=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["kernel_version"])' "$profiles/../sources.lock.json")
 src=/kernel-cache/linux-$version-carlinkit
 dtc=/kernel-cache/build/kernel-$version/scripts/dtc/dtc
 board=arch/arm/boot/dts/nxp/imx/imx6ull-carlinkit
-profiles=/work/kernel/profiles
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$work"   # merge_config.sh creates its temp files in the current directory
 
-cp /work/work/kernel-upstream/Kernel/config/imx6ull-carlinkit-6.18.config .config
+cp "$bundle/config/imx6ull-carlinkit-6.18.config" .config
 "$src/scripts/kconfig/merge_config.sh" -m -O "$work" .config "$profiles/usb-dev.config" >/dev/null
 make -s -C "$src" O="$work" ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- olddefconfig
 while IFS= read -r option; do
