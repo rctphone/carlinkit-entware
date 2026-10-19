@@ -1,0 +1,32 @@
+--- a/hcid/manager.c
++++ b/hcid/manager.c
+@@ -553,6 +553,9 @@
+ 	const struct adapter *adapter = a;
+ 	const char *address = b;
+ 
++	debug("adapter_address_cmp %s : %s, result: %d", adapter->address,
++				address, strcmp(adapter->address, address));
++
+ 	return strcmp(adapter->address, address);
+ }
+ 
+--- a/hcid/dbus-hci.c
++++ b/hcid/dbus-hci.c
+@@ -1092,6 +1092,8 @@
+ 		error("Device creation failed");
+ 		return -1;
+ 	}
++
++	info("device->auth=%d type=%d", device->auth, type);
+ 
+ 	/* If no MITM protection required, auto-accept */
+ 	if (!(device->auth & 0x01) && !(type & 0x01)) {
+@@ -2485,6 +2487,8 @@
+ 
+ 	*cap = agent_get_io_capability(agent);
+ 
++	info("*cap=%d *auth=%d", *cap, *auth);
++
+ 	return 0;
+ }
+ 

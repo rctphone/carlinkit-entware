@@ -1,0 +1,32 @@
+From: U2W build
+Subject: [PATCH] aacenc: accept AACENC_BITRATEMODE 8 for LD/ELD again
+
+AACENC_BITRATEMODE 8 ("LD/ELD full bitreservoir for packet based
+transmission") is still documented in aacenc_lib.h and still accepted by
+aacEncoder_SetParam, but since 0.1.5 FDKaacEnc_AdjustEncSettings no longer
+maps it to CBR, so the following check rejects it and the first
+aacEncEncode(NULL, ...) fails with AACENC_INVALID_CONFIG (0x23).
+
+AppleCarPlay configures its ELD encoder with exactly this mode (AOT 39,
+SBR off, TT_MP4_RAW, granule 480, BITRATEMODE 8, no AACENC_BITRATE); with
+stock 0.1.5/0.1.6 the CarPlay ELD (telephony/Siri uplink) encoder cannot be
+created.  Restore the 0.1.4 semantics: CBR (bitrateMode 0, default bitrate
+from rate/channels) with the full bit reservoir (bitreservoir -1, i.e.
+maxBitres in FDKaacEnc_Initialize), instead of the reduced LD reservoir used
+for mode 0.  With this patch the encoder yields the same ASC, bitrate and
+frame count as the vendor 0.1.4 library for that parameter set.
+
+--- a/libAACenc/src/aacenc_lib.cpp
++++ b/libAACenc/src/aacenc_lib.cpp
+@@ -824,6 +824,11 @@
+             hAacConfig->bitreservoir = bitreservoir & ~7; /* align to bytes */
+           }
+         }
++        if (config->userBitrateMode==8) {
++          /* Documented LD/ELD mode 8 (0.1.4): CBR with full bitreservoir. */
++          hAacConfig->bitrateMode = 0;
++          hAacConfig->bitreservoir = -1;
++        }
+         if (hAacConfig->bitrateMode!=0) {
+           return AACENC_INVALID_CONFIG;
+         }

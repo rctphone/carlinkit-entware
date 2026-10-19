@@ -1,0 +1,40 @@
+--- a/hcid/security.c
++++ b/hcid/security.c
+@@ -62,6 +62,10 @@
+ 
+ static struct g_io_info io_data[HCI_MAX_DEV];
+ 
++/* Carlinkit: last HCI event seen by io_security_event(); the vendor build
++ * stores it and never reads it back. */
++static int last_security_evt = -1;
++
+ static int pairing = HCID_PAIRING_MULTI;
+ 
+ static GSList *hci_req_queue = NULL;
+@@ -828,7 +832,26 @@
+ 	if (hci_test_bit(HCI_RAW, &di->flags))
+ 		return TRUE;
+ 
++	debug("io_security_event 0x%02x", eh->evt);
++
++	/* Carlinkit: pairing state for bluetoothDaemon, polled from
++	 * /tmp/bluetooth_status (same commands as the vendor hcid) */
+ 	switch (eh->evt) {
++	case EVT_CONN_REQUEST:
++		system("echo pair_start > /tmp/bluetooth_status");
++		break;
++	case EVT_DISCONN_COMPLETE:
++		system("echo disconnected > /tmp/bluetooth_status");
++		break;
++	case EVT_LINK_KEY_REQ:
++	case EVT_LINK_KEY_NOTIFY:
++		system("echo pair_success > /tmp/bluetooth_status");
++		break;
++	}
++
++	last_security_evt = eh->evt;
++
++	switch (eh->evt) {
+ 	case EVT_CMD_STATUS:
+ 		cmd_status(dev, &di->bdaddr, ptr);
+ 		break;

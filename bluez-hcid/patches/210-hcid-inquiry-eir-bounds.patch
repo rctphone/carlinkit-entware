@@ -1,0 +1,83 @@
+--- a/hcid/dbus-hci.c
++++ b/hcid/dbus-hci.c
+@@ -1666,9 +1666,15 @@
+ 						DBUS_TYPE_BOOLEAN,
+ 						&adapter->discov_active);
+ }
++
++/* Extended Inquiry Response data block (Core spec) */
++#define EIR_DATA_LENGTH 240
+ 
+ static char *extract_eir_name(uint8_t *data, uint8_t *type)
+ {
++	char *name, *end;
++	int len;
++
+ 	if (!data || !type)
+ 		return NULL;
+ 
+@@ -1680,7 +1686,17 @@
+ 	switch (*type) {
+ 	case 0x08:
+ 	case 0x09:
+-		return strndup((char *) (data + 2), data[0] - 1);
++		/* The field cannot run past the 240-byte EIR block, and the
++		 * name goes out as a D-Bus string: cut it at the first invalid
++		 * UTF-8 sequence like remote names (otherwise the bus drops
++		 * the connection) */
++		len = data[0] - 1;
++		if (len > EIR_DATA_LENGTH - 2)
++			len = EIR_DATA_LENGTH - 2;
++		name = strndup((char *) (data + 2), len);
++		if (name && !g_utf8_validate(name, -1, (const char **) &end))
++			*end = '\0';
++		return name;
+ 	}
+ 
+ 	return NULL;
+--- a/hcid/security.c
++++ b/hcid/security.c
+@@ -625,6 +625,12 @@
+ {
+ 	uint8_t num = *(uint8_t *) ptr++;
+ 	int i;
++
++	/* Never read past the event: plen bytes, then the response count */
++	if (plen < 1)
++		return;
++	if (num > (plen - 1) / INQUIRY_INFO_SIZE)
++		num = (plen - 1) / INQUIRY_INFO_SIZE;
+ 
+ 	for (i = 0; i < num; i++) {
+ 		inquiry_info *info = ptr;
+@@ -645,7 +651,7 @@
+ 	uint8_t num = *(uint8_t *) ptr++;
+ 	int i;
+ 
+-	if (!num)
++	if (!num || plen < 1)
+ 		return;
+ 
+ 	if ((plen - 1) / num == INQUIRY_INFO_WITH_RSSI_AND_PSCAN_MODE_SIZE) {
+@@ -663,6 +669,9 @@
+ 			ptr += INQUIRY_INFO_WITH_RSSI_AND_PSCAN_MODE_SIZE;
+ 		}
+ 	} else {
++		if (num > (plen - 1) / INQUIRY_INFO_WITH_RSSI_SIZE)
++			num = (plen - 1) / INQUIRY_INFO_WITH_RSSI_SIZE;
++
+ 		for (i = 0; i < num; i++) {
+ 			inquiry_info_with_rssi *info = ptr;
+ 			uint32_t class = info->dev_class[0]
+@@ -683,6 +692,11 @@
+ {
+ 	uint8_t num = *(uint8_t *) ptr++;
+ 	int i;
++
++	if (plen < 1)
++		return;
++	if (num > (plen - 1) / EXTENDED_INQUIRY_INFO_SIZE)
++		num = (plen - 1) / EXTENDED_INQUIRY_INFO_SIZE;
+ 
+ 	for (i = 0; i < num; i++) {
+ 		extended_inquiry_info *info = ptr;

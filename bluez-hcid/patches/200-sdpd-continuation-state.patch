@@ -1,0 +1,489 @@
+--- a/sdpd/sdpd.h
++++ b/sdpd/sdpd.h
+@@ -36,6 +36,7 @@
+ 	int      flags;
+ 	uint8_t  *buf;
+ 	int      len;
++	uint8_t  opcode;
+ } sdp_req_t;
+ 
+ void handle_request(int sk, uint8_t *data, int len);
+@@ -59,10 +60,10 @@
+ 
+ #define SDP_CONT_STATE_SIZE (sizeof(uint8_t) + sizeof(sdp_cont_state_t))
+ 
+-sdp_buf_t *sdp_get_cached_rsp(sdp_cont_state_t *cstate);
+-void sdp_cstate_cache_init(void);
+-void sdp_cstate_clean_buf(void);
+-uint32_t sdp_cstate_alloc_buf(sdp_buf_t *buf);
++sdp_buf_t *sdp_get_cached_rsp(sdp_req_t *req, sdp_cont_state_t *cstate);
++void sdp_cstate_free_rsp(sdp_buf_t *buf);
++void sdp_cstate_cleanup(int sock);
++uint32_t sdp_cstate_alloc_buf(sdp_req_t *req, sdp_buf_t *buf);
+ 
+ void sdp_svcdb_reset(void);
+ void sdp_svcdb_collect_all(int sock);
+--- a/sdpd/cstate.c
++++ b/sdpd/cstate.c
+@@ -31,6 +31,7 @@
+ #include <stdio.h>
+ #include <errno.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <sys/time.h>
+ #include <sys/socket.h>
+ 
+@@ -40,38 +41,118 @@
+ 
+ #include "sdpd.h"
+ 
++/*
++ * Cached responses for continuation requests. Backported from BlueZ 5.x
++ * (src/sdpd-request.c, CVE-2021-41229 and the CVE-2017-1000250 follow-ups):
++ * an entry belongs to the connection and the request type that created it,
++ * it is freed once the last fragment went out, when the client sends a new
++ * request without continuation state or an unknown one, and when the
++ * connection closes. The total number of entries is capped.
++ */
++#define SDP_CSTATE_MAX	16
++
+ typedef struct _sdp_cstate_list sdp_cstate_list_t;
+ 
+ struct _sdp_cstate_list {
+ 	sdp_cstate_list_t *next;
++	int sock;
++	uint8_t opcode;
+ 	uint32_t timestamp;
+ 	sdp_buf_t buf;
+ };
+ 
+ static sdp_cstate_list_t *cstates;
+ 
+-// FIXME: should probably remove it when it's found
+-sdp_buf_t *sdp_get_cached_rsp(sdp_cont_state_t *cstate)
++static void cstate_unlink(sdp_cstate_list_t **pp)
+ {
+-	sdp_cstate_list_t *p;
++	sdp_cstate_list_t *p = *pp;
+ 
+-	for (p = cstates; p; p = p->next)
+-		if (p->timestamp == cstate->timestamp)
++	*pp = p->next;
++	free(p->buf.data);
++	free(p);
++}
++
++sdp_buf_t *sdp_get_cached_rsp(sdp_req_t *req, sdp_cont_state_t *cstate)
++{
++	sdp_cstate_list_t **pp;
++
++	for (pp = &cstates; *pp; pp = &(*pp)->next) {
++		sdp_cstate_list_t *p = *pp;
++
++		if (p->sock != req->sock || p->timestamp != cstate->timestamp)
++			continue;
++
++		if (p->opcode == req->opcode)
+ 			return &p->buf;
+-	return 0;
++
++		/* The response is only valid for the request that created it */
++		cstate_unlink(pp);
++		return NULL;
++	}
++
++	/* Unknown continuation state: drop what this client had cached */
++	sdp_cstate_cleanup(req->sock);
++
++	return NULL;
+ }
+ 
+-uint32_t sdp_cstate_alloc_buf(sdp_buf_t *buf)
++void sdp_cstate_free_rsp(sdp_buf_t *buf)
+ {
+-	sdp_cstate_list_t *cstate = malloc(sizeof(sdp_cstate_list_t));
+-	uint8_t *data = malloc(buf->data_size);
++	sdp_cstate_list_t **pp;
+ 
++	if (!buf)
++		return;
++
++	for (pp = &cstates; *pp; pp = &(*pp)->next) {
++		if (&(*pp)->buf == buf) {
++			cstate_unlink(pp);
++			return;
++		}
++	}
++}
++
++void sdp_cstate_cleanup(int sock)
++{
++	sdp_cstate_list_t **pp = &cstates;
++
++	while (*pp) {
++		if ((*pp)->sock == sock)
++			cstate_unlink(pp);
++		else
++			pp = &(*pp)->next;
++	}
++}
++
++uint32_t sdp_cstate_alloc_buf(sdp_req_t *req, sdp_buf_t *buf)
++{
++	sdp_cstate_list_t *cstate, **pp;
++	uint8_t *data;
++	int count = 0;
++
++	/* Drop the oldest entries (list tail) above the cap */
++	for (pp = &cstates; *pp; ) {
++		if (++count >= SDP_CSTATE_MAX)
++			cstate_unlink(pp);
++		else
++			pp = &(*pp)->next;
++	}
++
++	cstate = malloc(sizeof(sdp_cstate_list_t));
++	data = malloc(buf->data_size);
++	if (!cstate || !data) {
++		free(cstate);
++		free(data);
++		return 0;
++	}
++
+ 	memcpy(data, buf->data, buf->data_size);
+ 	memset((char *)cstate, 0, sizeof(sdp_cstate_list_t));
+ 	cstate->buf.data = data;
+ 	cstate->buf.data_size = buf->data_size;
+ 	cstate->buf.buf_size = buf->data_size;
+ 	cstate->timestamp = sdp_get_time();
++	cstate->sock = req->sock;
++	cstate->opcode = req->opcode;
+ 	cstate->next = cstates;
+ 	cstates = cstate;
+ 	return cstate->timestamp;
+--- a/sdpd/server.c
++++ b/sdpd/server.c
+@@ -158,12 +158,14 @@
+ 
+ 	if (cond & (G_IO_HUP | G_IO_ERR)) {
+ 		sdp_svcdb_collect_all(sk);
++		sdp_cstate_cleanup(sk);
+ 		return FALSE;
+ 	}
+ 
+ 	len = recv(sk, &hdr, sizeof(sdp_pdu_hdr_t), MSG_PEEK);
+ 	if (len <= 0) {
+ 		sdp_svcdb_collect_all(sk);
++		sdp_cstate_cleanup(sk);
+ 		return FALSE;
+ 	}
+ 
+@@ -175,6 +177,7 @@
+ 	len = recv(sk, buf, size, 0);
+ 	if (len <= 0) {
+ 		sdp_svcdb_collect_all(sk);
++		sdp_cstate_cleanup(sk);
+ 		return FALSE;
+ 	}
+ 		
+--- a/sdpd/request.c
++++ b/sdpd/request.c
+@@ -188,28 +188,87 @@
+ 	return length;
+ }
+ 
+-static sdp_cont_state_t *sdp_cstate_get(uint8_t *buffer)
++/*
++ * Returns 0 and the continuation state (NULL if the request has none), or
++ * -1 if it is malformed: the state must be one we generated, so it has to
++ * be complete and inside the request (backport from BlueZ 5.x).
++ */
++static int sdp_cstate_get(sdp_req_t *req, uint8_t *buffer, int len,
++						sdp_cont_state_t **cstate)
+ {
+ 	uint8_t *pdata = buffer;
+-	uint8_t cStateSize = *(uint8_t *)pdata;
++	uint8_t cStateSize;
+ 
++	*cstate = NULL;
++
++	if (len < (int) sizeof(uint8_t))
++		return -1;
++
++	cStateSize = *(uint8_t *)pdata;
++
+ 	/*
+ 	 * Check if continuation state exists, if yes attempt
+ 	 * to get response remainder from cache, else send error
+ 	 */
+ 	debug("Continuation State size : %d", cStateSize);
+ 
++	if (cStateSize == 0) {
++		/* A new request: drop what this client still had cached */
++		sdp_cstate_cleanup(req->sock);
++		return 0;
++	}
++
+ 	pdata += sizeof(uint8_t);
+-	if (cStateSize != 0) {
+-		sdp_cont_state_t *cstate = malloc(sizeof(sdp_cont_state_t));
+-		if (!cstate)
+-			return NULL;
+-		memcpy(cstate, (sdp_cont_state_t *)pdata, sizeof(sdp_cont_state_t));
+-		debug("Cstate TS : 0x%lx", cstate->timestamp);
+-		debug("Bytes sent : %d", cstate->cStateValue.maxBytesSent);
+-		return cstate;
++	len -= sizeof(uint8_t);
++
++	if (cStateSize < sizeof(sdp_cont_state_t) ||
++				len < (int) sizeof(sdp_cont_state_t))
++		return -1;
++
++	*cstate = malloc(sizeof(sdp_cont_state_t));
++	if (!*cstate)
++		return -1;
++
++	memcpy(*cstate, pdata, sizeof(sdp_cont_state_t));
++	debug("Cstate TS : 0x%lx", (unsigned long) (*cstate)->timestamp);
++	debug("Bytes sent : %d", (*cstate)->cStateValue.maxBytesSent);
++
++	return 0;
++}
++
++/*
++ * Copy the next fragment of a cached attribute response (backport of
++ * sdp_cstate_rsp() from BlueZ 5.x). Returns the size of the continuation
++ * state appended, 0 if the state does not fit the cached response
++ * (CVE-2017-1000250, CVE-2019-8921).
++ */
++static int sdp_cstate_rsp(sdp_buf_t *cache, sdp_cont_state_t *cstate,
++					sdp_buf_t *buf, unsigned int max)
++{
++	unsigned int sent;
++
++	if (!cache)
++		return 0;
++
++	if (cstate->cStateValue.maxBytesSent >= cache->data_size) {
++		sdp_cstate_free_rsp(cache);
++		return 0;
+ 	}
+-	return NULL;
++
++	sent = MIN(max, cache->data_size - cstate->cStateValue.maxBytesSent);
++	memcpy(buf->data, cache->data + cstate->cStateValue.maxBytesSent, sent);
++	buf->data_size += sent;
++	cstate->cStateValue.maxBytesSent += sent;
++
++	debug("Response size : %d sending now : %d bytes sent so far : %d",
++		cache->data_size, sent, cstate->cStateValue.maxBytesSent);
++
++	if (cstate->cStateValue.maxBytesSent == cache->data_size) {
++		sdp_cstate_free_rsp(cache);
++		return sdp_set_cstate_pdu(buf, NULL);
++	}
++
++	return sdp_set_cstate_pdu(buf, cstate);
+ }
+ 
+ /*
+@@ -264,6 +323,7 @@
+ 	uint8_t dtd;
+ 	sdp_cont_state_t *cstate = NULL;
+ 	uint8_t *pCacheBuffer = NULL;
++	sdp_buf_t *pCache = NULL;
+ 	int handleSize = 0;
+ 	uint32_t cStateId = 0;
+ 	short *pTotalRecordCount, *pCurrentRecordCount;
+@@ -297,7 +357,11 @@
+ 	 * Check if continuation state exists, if yes attempt
+ 	 * to get rsp remainder from cache, else send error
+ 	 */
+-	cstate = sdp_cstate_get(pdata);
++	if (sdp_cstate_get(req, pdata, req->buf + req->len - pdata,
++							&cstate) < 0) {
++		status = SDP_INVALID_SYNTAX;
++		goto done;
++	}
+ 
+ 	mtu = req->mtu - sizeof(sdp_pdu_hdr_t) - sizeof(uint16_t) - sizeof(uint16_t) - SDP_CONT_STATE_SIZE;
+ 	actual = MIN(expected, mtu >> 2);
+@@ -344,7 +408,7 @@
+ 
+ 		if (rsp_count > actual) {
+ 			/* cache the rsp and generate a continuation state */
+-			cStateId = sdp_cstate_alloc_buf(buf);
++			cStateId = sdp_cstate_alloc_buf(req, buf);
+ 			/*
+ 			 * subtract handleSize since we now send only
+ 			 * a subset of handles
+@@ -365,13 +429,29 @@
+ 			 * Get the previous sdp_cont_state_t and obtain
+ 			 * the cached rsp
+ 			 */
+-			sdp_buf_t *pCache = sdp_get_cached_rsp(cstate);
++			pCache = sdp_get_cached_rsp(req, cstate);
+ 			if (pCache) {
++				/* Check if requesting more than available */
++				if (pCache->data_size < 2 * sizeof(uint16_t) ||
++						cstate->cStateValue.maxBytesSent >=
++							pCache->data_size) {
++					sdp_cstate_free_rsp(pCache);
++					status = SDP_INVALID_CSTATE;
++					goto done;
++				}
++
+ 				pCacheBuffer = pCache->data;
+ 				/* get the rsp_count from the cached buffer */
+ 				rsp_count = ntohs(bt_get_unaligned((uint16_t *)pCacheBuffer));
+ 
+ 				/* get index of the last sdp_record_t sent */
++				if (cstate->cStateValue.lastIndexSent >= rsp_count ||
++						pCache->data_size < 2 * sizeof(uint16_t) +
++						rsp_count * sizeof(uint32_t)) {
++					sdp_cstate_free_rsp(pCache);
++					status = SDP_INVALID_CSTATE;
++					goto done;
++				}
+ 				lastIndex = cstate->cStateValue.lastIndexSent;
+ 			} else {
+ 				status = SDP_INVALID_CSTATE;
+@@ -411,6 +491,7 @@
+ 		if (i == rsp_count) {
+ 			/* set "null" continuationState */
+ 			sdp_set_cstate_pdu(buf, NULL);
++			sdp_cstate_free_rsp(pCache);
+ 		} else {
+ 			/*
+ 			 * there's more: set lastIndexSent to
+@@ -518,7 +599,6 @@
+ static int service_attr_req(sdp_req_t *req, sdp_buf_t *buf)
+ {
+ 	sdp_cont_state_t *cstate = NULL;
+-	uint8_t *pResponse = NULL;
+ 	short cstate_size = 0;
+ 	sdp_list_t *seq = NULL;
+ 	uint8_t dtd = 0;
+@@ -553,7 +633,11 @@
+ 	 * if continuation state exists, attempt
+ 	 * to get rsp remainder from cache, else send error
+ 	 */
+-	cstate = sdp_cstate_get(pdata);
++	if (sdp_cstate_get(req, pdata, req->buf + req->len - pdata,
++							&cstate) < 0) {
++		status = SDP_INVALID_SYNTAX;
++		goto done;
++	}
+ 
+ 	debug("SvcRecHandle : 0x%x", handle);
+ 	debug("max_rsp_size : %d", max_rsp_size);
+@@ -570,24 +654,12 @@
+ 	buf->buf_size -= sizeof(uint16_t);
+ 
+ 	if (cstate) {
+-		sdp_buf_t *pCache = sdp_get_cached_rsp(cstate);
++		sdp_buf_t *pCache = sdp_get_cached_rsp(req, cstate);
+ 
+ 		debug("Obtained cached rsp : %p", pCache);
+ 
+-		if (pCache) {
+-			short sent = MIN(max_rsp_size, pCache->data_size - cstate->cStateValue.maxBytesSent);
+-			pResponse = pCache->data;
+-			memcpy(buf->data, pResponse + cstate->cStateValue.maxBytesSent, sent);
+-			buf->data_size += sent;
+-			cstate->cStateValue.maxBytesSent += sent;
+-
+-			debug("Response size : %d sending now : %d bytes sent so far : %d",
+-				pCache->data_size, sent, cstate->cStateValue.maxBytesSent);
+-			if (cstate->cStateValue.maxBytesSent == pCache->data_size)
+-				cstate_size = sdp_set_cstate_pdu(buf, NULL);
+-			else
+-				cstate_size = sdp_set_cstate_pdu(buf, cstate);
+-		} else {
++		cstate_size = sdp_cstate_rsp(pCache, cstate, buf, max_rsp_size);
++		if (!cstate_size) {
+ 			status = SDP_INVALID_CSTATE;
+ 			error("NULL cache buffer and non-NULL continuation state");
+ 		}
+@@ -598,7 +670,7 @@
+ 			sdp_cont_state_t newState;
+ 
+ 			memset((char *)&newState, 0, sizeof(sdp_cont_state_t));
+-			newState.timestamp = sdp_cstate_alloc_buf(buf);
++			newState.timestamp = sdp_cstate_alloc_buf(req, buf);
+ 			/*
+ 			 * Reset the buffer size to the maximum expected and
+ 			 * set the sdp_cont_state_t
+@@ -638,7 +710,7 @@
+ static int service_search_attr_req(sdp_req_t *req, sdp_buf_t *buf)
+ {
+ 	int status = 0, plen, totscanned;
+-	uint8_t *pdata, *pResponse = NULL;
++	uint8_t *pdata;
+ 	int scanned, max, rsp_count = 0;
+ 	sdp_list_t *pattern = NULL, *seq = NULL, *svcList;
+ 	sdp_cont_state_t *cstate = NULL;
+@@ -684,7 +756,11 @@
+ 	 * if continuation state exists attempt
+ 	 * to get rsp remainder from cache, else send error
+ 	 */
+-	cstate = sdp_cstate_get(pdata);	// continuation information
++	if (sdp_cstate_get(req, pdata, req->buf + req->len - pdata,
++							&cstate) < 0) {
++		status = SDP_INVALID_SYNTAX;
++		goto done;
++	}
+ 
+ 	svcList = sdp_get_record_list();
+ 
+@@ -735,7 +811,7 @@
+ 			sdp_cont_state_t newState;
+ 
+ 			memset((char *)&newState, 0, sizeof(sdp_cont_state_t));
+-			newState.timestamp = sdp_cstate_alloc_buf(buf);
++			newState.timestamp = sdp_cstate_alloc_buf(req, buf);
+ 			/*
+ 			 * Reset the buffer size to the maximum expected and
+ 			 * set the sdp_cont_state_t
+@@ -747,18 +823,10 @@
+ 			cstate_size = sdp_set_cstate_pdu(buf, NULL);
+ 	} else {
+ 		/* continuation State exists -> get from cache */
+-		sdp_buf_t *pCache = sdp_get_cached_rsp(cstate);
+-		if (pCache) {
+-			uint16_t sent = MIN(max, pCache->data_size - cstate->cStateValue.maxBytesSent);
+-			pResponse = pCache->data;
+-			memcpy(buf->data, pResponse + cstate->cStateValue.maxBytesSent, sent);
+-			buf->data_size += sent;
+-			cstate->cStateValue.maxBytesSent += sent;
+-			if (cstate->cStateValue.maxBytesSent == pCache->data_size)
+-				cstate_size = sdp_set_cstate_pdu(buf, NULL);
+-			else
+-				cstate_size = sdp_set_cstate_pdu(buf, cstate);
+-		} else {
++		sdp_buf_t *pCache = sdp_get_cached_rsp(req, cstate);
++
++		cstate_size = sdp_cstate_rsp(pCache, cstate, buf, max);
++		if (!cstate_size) {
+ 			status = SDP_INVALID_CSTATE;
+ 			debug("Non-null continuation state, but null cache buffer");
+ 		}
+@@ -817,6 +885,9 @@
+ 		status = SDP_INVALID_PDU_SIZE;
+ 		goto send_rsp;
+ 	}
++
++	req->opcode = reqhdr->pdu_id;
++
+ 	switch (reqhdr->pdu_id) {
+ 	case SDP_SVC_SEARCH_REQ:
+ 		debug("Got a svc srch req");
+@@ -863,6 +934,8 @@
+ 
+ send_rsp:
+ 	if (status) {
++		/* Cleanup cstates on error */
++		sdp_cstate_cleanup(req->sock);
+ 		rsphdr->pdu_id = SDP_ERROR_RSP;
+ 		bt_put_unaligned(htons(status), (uint16_t *)rsp.data);
+ 		rsp.data_size = sizeof(uint16_t);

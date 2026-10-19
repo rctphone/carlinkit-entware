@@ -1,0 +1,34 @@
+mDNSPosix: Carlinkit DirectLink interfaces (port of the vendor mdnsd patch).
+
+The vendor mdnsd (878.270.2) marks every interface whose 3-character name prefix
+occurs in "ncm,usb,wlan" (strstr, so usb0, ncm0, wlan0) as DirectLink: its address
+records are KnownUnique (no probing) and it gets fast activation. It logs
+"DIRECTLINK_INTERFACE_NAME: %s, intfName: %s, DirectLink: %d" for names longer
+than two characters. Same behaviour and message here.
+
+--- a/mDNSPosix/mDNSPosix.c
++++ b/mDNSPosix/mDNSPosix.c
+@@ -1454,11 +1454,19 @@ mDNSlocal int SetupOneInterface(mDNS *const m, struct sockaddr *intfAddr, struct
+ 
+     // If interface is a direct link, address record will be marked as kDNSRecordTypeKnownUnique
+     // and skip the probe phase of the probe/announce packet sequence.
++    // Carlinkit (vendor mdnsd): an interface whose 3-character name prefix occurs in the list below
++    // (substring match, as in the vendor build) is a direct link.
+     intf->coreIntf.DirectLink = mDNSfalse;
+-#ifdef DIRECTLINK_INTERFACE_NAME
+-    if (strcmp(intfName, STRINGIFY(DIRECTLINK_INTERFACE_NAME)) == 0)
+-        intf->coreIntf.DirectLink = mDNStrue;
+-#endif
++    if (strlen(intfName) > 2)
++    {
++        static const char kDirectLinkInterfaceNames[] = "ncm,usb,wlan";
++        char prefix[4] = { 0 };
++        memcpy(prefix, intfName, 3);
++        if (strstr(kDirectLinkInterfaceNames, prefix) != NULL)
++            intf->coreIntf.DirectLink = mDNStrue;
++        LogMsgWithLevel(mDNSNULL, MDNS_LOG_DEFAULT, "DIRECTLINK_INTERFACE_NAME: %s, intfName: %s, DirectLink: %d",
++            kDirectLinkInterfaceNames, intfName, intf->coreIntf.DirectLink);              // vendor text, no category
++    }
+     intf->coreIntf.SupportsUnicastMDNSResponse = mDNStrue;
+ 
+     // The interface is all ready to go, let's register it with the mDNS core.

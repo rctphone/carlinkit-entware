@@ -1,0 +1,644 @@
+--- a/sdpd/request.c
++++ b/sdpd/request.c
+@@ -49,11 +49,25 @@
+ 
+ /* Additional values for checking datatype (not in spec) */
+ #define SDP_TYPE_UUID	0xfe
+-#define SDP_TYPE_ANY	0xff
++#define SDP_TYPE_ATTRID	0xff
+ 
+ /*
++ * Attribute ID list element: each one keeps its own type, so a list mixing
++ * IDs and ranges is read correctly (backport from BlueZ 5.x; 3.36 applied
++ * the type of the last element to all of them and read 4 bytes from
++ * 2-byte elements).
++ */
++struct attrid {
++	uint8_t dtd;
++	union {
++		uint16_t uint16;
++		uint32_t uint32;
++	};
++};
++
++/*
+  * Generic data element sequence extractor. Builds
+- * a list whose elements are those found in the 
++ * a list whose elements are those found in the
+  * sequence. The data type of elements found in the
+  * sequence is returned in the reference pDataType
+  */
+@@ -69,6 +83,9 @@
+ 	const uint8_t *p;
+ 	int bufsize;
+ 
++	if (len <= 0)
++		return -1;
++
+ 	scanned = sdp_extract_seqtype_safe(buf, len, &seqType, &data_size);
+ 
+ 	debug("Seq type : %d", seqType);
+@@ -85,9 +102,9 @@
+ 		char *pElem = NULL;
+ 		int localSeqLength = 0;
+ 
+-		if (bufsize < sizeof(uint8_t)) {
++		if (bufsize < (int) sizeof(uint8_t)) {
+ 			debug("->Unexpected end of buffer");
+-			return -1;
++			goto failed;
+ 		}
+ 
+ 		dataType = *(uint8_t *)p;
+@@ -96,11 +113,17 @@
+ 		if (expectedType == SDP_TYPE_UUID) {
+ 			if (dataType != SDP_UUID16 && dataType != SDP_UUID32 && dataType != SDP_UUID128) {
+ 				debug("->Unexpected Data type (expected UUID_ANY)");
+-				return -1;
++				goto failed;
+ 			}
+-		} else if (expectedType != SDP_TYPE_ANY && dataType != expectedType) {
++		} else if (expectedType == SDP_TYPE_ATTRID) {
++			if (dataType != SDP_UINT16 && dataType != SDP_UINT32) {
++				debug("->Unexpected Data type (expected 0x%02x or 0x%02x)",
++							SDP_UINT16, SDP_UINT32);
++				goto failed;
++			}
++		} else if (dataType != expectedType) {
+ 			debug("->Unexpected Data type (expected 0x%02x)", expectedType);
+-			return -1;
++			goto failed;
+ 		}
+ 
+ 		switch (dataType) {
+@@ -108,13 +131,24 @@
+ 			p += sizeof(uint8_t);
+ 			seqlen += sizeof(uint8_t);
+ 			bufsize -= sizeof(uint8_t);
+-			if (bufsize < sizeof(uint16_t)) {
++			if (bufsize < (int) sizeof(uint16_t)) {
+ 				debug("->Unexpected end of buffer");
+-				return -1;
++				goto failed;
+ 			}
+ 
+-			pElem = malloc(sizeof(uint16_t));
+-			bt_put_unaligned(ntohs(bt_get_unaligned((uint16_t *)p)), (uint16_t *)pElem);
++			if (expectedType == SDP_TYPE_ATTRID) {
++				struct attrid *aid = malloc(sizeof(struct attrid));
++				if (!aid)
++					goto failed;
++				aid->dtd = dataType;
++				aid->uint16 = ntohs(bt_get_unaligned((uint16_t *)p));
++				pElem = (char *) aid;
++			} else {
++				pElem = malloc(sizeof(uint16_t));
++				if (!pElem)
++					goto failed;
++				bt_put_unaligned(ntohs(bt_get_unaligned((uint16_t *)p)), (uint16_t *)pElem);
++			}
+ 			p += sizeof(uint16_t);
+ 			seqlen += sizeof(uint16_t);
+ 			bufsize -= sizeof(uint16_t);
+@@ -125,11 +159,22 @@
+ 			bufsize -= sizeof(uint8_t);
+ 			if (bufsize < (int)sizeof(uint32_t)) {
+ 				debug("->Unexpected end of buffer");
+-				return -1;
++				goto failed;
+ 			}
+ 
+-			pElem = malloc(sizeof(uint32_t));
+-			bt_put_unaligned(ntohl(bt_get_unaligned((uint32_t *)p)), (uint32_t *)pElem);
++			if (expectedType == SDP_TYPE_ATTRID) {
++				struct attrid *aid = malloc(sizeof(struct attrid));
++				if (!aid)
++					goto failed;
++				aid->dtd = dataType;
++				aid->uint32 = ntohl(bt_get_unaligned((uint32_t *)p));
++				pElem = (char *) aid;
++			} else {
++				pElem = malloc(sizeof(uint32_t));
++				if (!pElem)
++					goto failed;
++				bt_put_unaligned(ntohl(bt_get_unaligned((uint32_t *)p)), (uint32_t *)pElem);
++			}
+ 			p += sizeof(uint32_t);
+ 			seqlen += sizeof(uint32_t);
+ 			bufsize -= sizeof(uint32_t);
+@@ -138,34 +183,144 @@
+ 		case SDP_UUID32:
+ 		case SDP_UUID128:
+ 			pElem = malloc(sizeof(uuid_t));
++			if (!pElem)
++				goto failed;
+ 			status = sdp_uuid_extract_safe(p, bufsize, (uuid_t *) pElem, &localSeqLength);
+-			if (status == 0) {
+-				seqlen += localSeqLength;
+-				p += localSeqLength;
+-				bufsize -= localSeqLength;
++			if (status < 0 || localSeqLength <= 0) {
++				/* 3.36 retried the same bytes forever here */
++				free(pElem);
++				goto failed;
+ 			}
++			seqlen += localSeqLength;
++			p += localSeqLength;
++			bufsize -= localSeqLength;
+ 			break;
+ 		default:
+-			return -1;
++			goto failed;
+ 		}
+-		if (status == 0) {
+-			pSeq = sdp_list_append(pSeq, pElem);
+-			numberOfElements++;
+-			debug("No of elements : %d", numberOfElements);
+ 
+-			if (seqlen == data_size)
+-				break;
+-			else if (seqlen > data_size || seqlen > len)
+-				return -1;
+-		} else
+-			free(pElem);
++		pSeq = sdp_list_append(pSeq, pElem);
++		numberOfElements++;
++		debug("No of elements : %d", numberOfElements);
++
++		if (seqlen == data_size)
++			break;
++		else if (seqlen > data_size || seqlen > len)
++			goto failed;
+ 	}
+ 	*svcReqSeq = pSeq;
+ 	scanned += seqlen;
+ 	*pDataType = dataType;
+ 	return scanned;
++
++failed:
++	sdp_list_free(pSeq, free);
++	return -1;
++}
++
++/*
++ * Response building without the libbluetooth 3.36 helpers on the request
++ * path: those realloc() a full destination (the SDP response buffer is not
++ * the start of a heap block) and render each attribute into a 256-byte
++ * stack buffer. A request repeating attribute IDs or ranges could grow a
++ * response past its buffer (CVE-2019-8922). As in BlueZ 5.x the data that
++ * does not fit is dropped instead.
++ */
++static int sdpd_append_to_buf(sdp_buf_t *dst, uint8_t *data, uint32_t len)
++{
++	uint8_t *p = dst->data;
++	uint8_t dtd = *p;
++	uint32_t need = len;
++
++	if (dst->data_size == 0 && dtd == 0)
++		need += 2 * sizeof(uint8_t);
++	if (dtd != SDP_SEQ16 && dtd != SDP_SEQ32)
++		need += sizeof(uint8_t);	/* SEQ8 may become SEQ16 */
++
++	if (dst->data_size + need > dst->buf_size) {
++		error("Cannot append %u bytes to SDP response (%u of %u used)",
++				len, dst->data_size, dst->buf_size);
++		return -1;
++	}
++
++	if (dst->data_size == 0 && dtd == 0) {
++		/* create initial sequence */
++		*p = SDP_SEQ8;
++		dst->data_size += sizeof(uint8_t);
++		/* reserve space for sequence size */
++		dst->data_size += sizeof(uint8_t);
++	}
++
++	if (len)
++		memcpy(dst->data + dst->data_size, data, len);
++	dst->data_size += len;
++
++	dtd = *(uint8_t *) dst->data;
++	if (dst->data_size > UCHAR_MAX && dtd == SDP_SEQ8) {
++		short offset = sizeof(uint8_t) + sizeof(uint8_t);
++		memmove(dst->data + offset + 1, dst->data + offset,
++						dst->data_size - offset);
++		*p = SDP_SEQ16;
++		dst->data_size += 1;
++	}
++
++	dtd = *(uint8_t *) p;
++	p += sizeof(uint8_t);
++	switch (dtd) {
++	case SDP_SEQ8:
++		*(uint8_t *) p = dst->data_size - sizeof(uint8_t) - sizeof(uint8_t);
++		break;
++	case SDP_SEQ16:
++		bt_put_unaligned(htons(dst->data_size - sizeof(uint8_t) - sizeof(uint16_t)), (uint16_t *) p);
++		break;
++	case SDP_SEQ32:
++		bt_put_unaligned(htonl(dst->data_size - sizeof(uint8_t) - sizeof(uint32_t)), (uint32_t *) p);
++		break;
++	}
++
++	return 0;
++}
++
++static int sdpd_append_to_pdu(sdp_buf_t *pdu, sdp_data_t *d)
++{
++	sdp_buf_t append;
++	int err;
++
++	/* One attribute of a local record: at most one SDP PDU */
++	memset(&append, 0, sizeof(sdp_buf_t));
++	append.data = malloc(USHRT_MAX);
++	if (!append.data)
++		return -1;
++	append.buf_size = USHRT_MAX;
++
++	sdp_set_attrid(&append, d->attrId);
++	sdp_gen_pdu(&append, d);
++	err = sdpd_append_to_buf(pdu, append.data, append.data_size);
++
++	free(append.data);
++
++	return err;
+ }
+ 
++static int sdpd_gen_record_pdu(sdp_record_t *rec, sdp_buf_t *pdu)
++{
++	sdp_list_t *l;
++
++	pdu->data = malloc(USHRT_MAX);
++	if (!pdu->data)
++		return -1;
++
++	pdu->buf_size = USHRT_MAX;
++	pdu->data_size = 0;
++	memset(pdu->data, 0, pdu->buf_size);
++
++	for (l = rec->attrlist; l; l = l->next)
++		if (sdpd_append_to_pdu(pdu, l->data) < 0)
++			break;
++
++	return 0;
++}
++
+ static int sdp_set_cstate_pdu(sdp_buf_t *buf, sdp_cont_state_t *cstate)
+ {
+ 	uint8_t *pdata = buf->data + buf->data_size;
+@@ -528,38 +683,40 @@
+  * requested identifiers are present in the PDU form of
+  * the request
+  */
+-static int extract_attrs(sdp_record_t *rec, sdp_list_t *seq, uint8_t dtd, sdp_buf_t *buf)
++static int extract_attrs(sdp_record_t *rec, sdp_list_t *seq, sdp_buf_t *buf)
+ {
++	sdp_buf_t pdu;
++
+ 	if (!rec)
+ 		return SDP_INVALID_RECORD_HANDLE;
+ 
+-	if (seq)
+-		debug("Entries in attr seq : %d", sdp_list_len(seq));
+-	else
+-		debug("NULL attribute descriptor");
+-
+-	debug("AttrDataType : %d", dtd);
+-
+ 	if (seq == NULL) {
+ 		debug("Attribute sequence is NULL");
+ 		return 0;
+ 	}
+-	if (dtd == SDP_UINT16)
+-		for (; seq; seq = seq->next) {
+-			uint16_t attr = bt_get_unaligned((uint16_t *)seq->data);
++
++	debug("Entries in attr seq : %d", sdp_list_len(seq));
++
++	if (sdpd_gen_record_pdu(rec, &pdu) < 0)
++		return SDP_INVALID_SYNTAX;
++
++	for (; seq; seq = seq->next) {
++		struct attrid *aid = seq->data;
++
++		debug("AttrDataType : %d", aid->dtd);
++
++		if (aid->dtd == SDP_UINT16) {
++			uint16_t attr = aid->uint16;
+ 			sdp_data_t *a = (sdp_data_t *)sdp_data_get(rec, attr);
+-			if (a)
+-				sdp_append_to_pdu(buf, a);
+-		}
+-	else if (dtd == SDP_UINT32) {
+-		sdp_buf_t pdu;
+-		sdp_gen_record_pdu(rec, &pdu);
+-		for (; seq; seq = seq->next) {
+-			uint32_t range = bt_get_unaligned((uint32_t *)seq->data);
++			if (a && sdpd_append_to_pdu(buf, a) < 0)
++				break;
++		} else if (aid->dtd == SDP_UINT32) {
++			uint32_t range = aid->uint32;
+ 			uint16_t attr;
+ 			uint16_t low = (0xffff0000 & range) >> 16;
+ 			uint16_t high = 0x0000ffff & range;
+ 			sdp_data_t *data;
++			int err = 0;
+ 
+ 			debug("attr range : 0x%x", range);
+ 			debug("Low id : 0x%x", low);
+@@ -572,21 +729,26 @@
+ 				break;
+ 			}
+ 			/* (else) sub-range of attributes */
+-			for (attr = low; attr < high; attr++) {
++			for (attr = low; attr < high && !err; attr++) {
+ 				data = sdp_data_get(rec, attr);
+ 				if (data)
+-					sdp_append_to_pdu(buf, data);
++					err = sdpd_append_to_pdu(buf, data);
+ 			}
++			if (err)
++				break;
+ 			data = sdp_data_get(rec, high);
+-			if (data)
+-				sdp_append_to_pdu(buf, data);
++			if (data && sdpd_append_to_pdu(buf, data) < 0)
++				break;
++		} else {
++			error("Unexpected data type : 0x%x", aid->dtd);
++			error("Expect uint16_t or uint32_t");
++			free(pdu.data);
++			return SDP_INVALID_SYNTAX;
+ 		}
+-		free(pdu.data);
+-	} else {
+-		error("Unexpected data type : 0x%x", dtd);
+-		error("Expect uint16_t or uint32_t");
+-		return SDP_INVALID_SYNTAX;
+ 	}
++
++	free(pdu.data);
++
+ 	return 0;
+ }
+ 
+@@ -606,15 +768,25 @@
+ 	int max_rsp_size;
+ 	int status = 0, plen, mlen;
+ 	uint8_t *pdata = req->buf + sizeof(sdp_pdu_hdr_t);
+-	uint32_t handle = ntohl(bt_get_unaligned((uint32_t *)pdata));
++	int data_left = req->len - sizeof(sdp_pdu_hdr_t);
++	uint32_t handle;
+ 
++	/* handle, maximum byte count and at least an empty sequence */
++	if (data_left < (int) (sizeof(uint32_t) + sizeof(uint16_t) +
++						2 * sizeof(uint8_t))) {
++		status = SDP_INVALID_SYNTAX;
++		goto done;
++	}
++
++	handle = ntohl(bt_get_unaligned((uint32_t *)pdata));
+ 	pdata += sizeof(uint32_t);
++	data_left -= sizeof(uint32_t);
+ 	max_rsp_size = ntohs(bt_get_unaligned((uint16_t *)pdata));
+ 	pdata += sizeof(uint16_t);
++	data_left -= sizeof(uint16_t);
+ 
+ 	/* extract the attribute list */
+-	scanned = extract_des(pdata, req->len - sizeof(sdp_pdu_hdr_t),
+-						&seq, &dtd, SDP_TYPE_ANY);
++	scanned = extract_des(pdata, data_left, &seq, &dtd, SDP_TYPE_ATTRID);
+ 	if (scanned == -1) {
+ 		status = SDP_INVALID_SYNTAX;
+ 		goto done;
+@@ -642,6 +814,15 @@
+ 	debug("SvcRecHandle : 0x%x", handle);
+ 	debug("max_rsp_size : %d", max_rsp_size);
+ 
++	/*
++	 * Check that max_rsp_size is within valid range
++	 * a minimum size of 0x0007 has to be used for data field
++	 */
++	if (max_rsp_size < 0x0007) {
++		status = SDP_INVALID_SYNTAX;
++		goto done;
++	}
++
+ 	/* 
+ 	 * Calculate Attribute size acording to MTU
+ 	 * We can send only (MTU - sizeof(sdp_pdu_hdr_t) - sizeof(sdp_cont_state_t))
+@@ -665,7 +846,7 @@
+ 		}
+ 	} else {
+ 		sdp_record_t *rec = sdp_record_find(handle);
+-		status = extract_attrs(rec, seq, dtd, buf);
++		status = extract_attrs(rec, seq, buf);
+ 		if (buf->data_size > max_rsp_size) {
+ 			sdp_cont_state_t newState;
+ 
+@@ -681,7 +862,7 @@
+ 			cstate_size = sdp_set_cstate_pdu(buf, &newState);
+ 		} else {
+ 			if (buf->data_size == 0)
+-				sdp_append_to_buf(buf, 0, 0);
++				sdpd_append_to_buf(buf, NULL, 0);
+ 			cstate_size = sdp_set_cstate_pdu(buf, NULL);
+ 		}
+ 	}
+@@ -717,11 +898,12 @@
+ 	short cstate_size = 0;
+ 	uint8_t dtd = 0;
+ 	sdp_buf_t tmpbuf;
++	int data_left;
+ 
+ 	tmpbuf.data = NULL;
+ 	pdata = req->buf + sizeof(sdp_pdu_hdr_t);
+-	scanned = extract_des(pdata, req->len - sizeof(sdp_pdu_hdr_t),
+-					&pattern, &dtd, SDP_TYPE_UUID);
++	data_left = req->len - sizeof(sdp_pdu_hdr_t);
++	scanned = extract_des(pdata, data_left, &pattern, &dtd, SDP_TYPE_UUID);
+ 	if (scanned == -1) {
+         	status = SDP_INVALID_SYNTAX;
+ 		goto done;
+@@ -731,14 +913,22 @@
+ 	debug("Bytes scanned: %d", scanned);
+ 
+ 	pdata += scanned;
++	data_left -= scanned;
++
++	/* maximum byte count and at least an empty sequence */
++	if (data_left < (int) (sizeof(uint16_t) + 2 * sizeof(uint8_t))) {
++		status = SDP_INVALID_SYNTAX;
++		goto done;
++	}
++
+ 	max = ntohs(bt_get_unaligned((uint16_t *)pdata));
+ 	pdata += sizeof(uint16_t);
++	data_left -= sizeof(uint16_t);
+ 
+ 	debug("Max Attr expected: %d", max);
+ 
+ 	/* extract the attribute list */
+-	scanned = extract_des(pdata, req->len - sizeof(sdp_pdu_hdr_t),
+-						&seq, &dtd, SDP_TYPE_ANY);
++	scanned = extract_des(pdata, data_left, &seq, &dtd, SDP_TYPE_ATTRID);
+ 	if (scanned == -1) {
+ 		status = SDP_INVALID_SYNTAX;
+ 		goto done;
+@@ -765,6 +955,10 @@
+ 	svcList = sdp_get_record_list();
+ 
+ 	tmpbuf.data = malloc(USHRT_MAX);
++	if (!tmpbuf.data) {
++		status = SDP_INVALID_SYNTAX;
++		goto done;
++	}
+ 	tmpbuf.data_size = 0;
+ 	tmpbuf.buf_size = USHRT_MAX;
+ 	memset(tmpbuf.data, 0, USHRT_MAX);
+@@ -787,7 +981,7 @@
+ 			if (sdp_match_uuid(pattern, rec->pattern) > 0 &&
+ 					sdp_check_access(rec->handle, &req->device)) {
+ 				rsp_count++;
+-				status = extract_attrs(rec, seq, dtd, &tmpbuf);
++				status = extract_attrs(rec, seq, &tmpbuf);
+ 
+ 				debug("Response count : %d", rsp_count);
+ 				debug("Local PDU size : %d", tmpbuf.data_size);
+@@ -795,9 +989,10 @@
+ 					debug("Extract attr from record returns err");
+ 					break;
+ 				}
+-				if (buf->data_size + tmpbuf.data_size < buf->buf_size) {
++				if (buf->data_size + tmpbuf.data_size < buf->buf_size &&
++						sdpd_append_to_buf(buf, tmpbuf.data,
++							tmpbuf.data_size) == 0) {
+ 					// to be sure no relocations
+-					sdp_append_to_buf(buf, tmpbuf.data, tmpbuf.data_size);
+ 					tmpbuf.data_size = 0;
+ 					memset(tmpbuf.data, 0, USHRT_MAX);
+ 				} else {
+@@ -835,7 +1030,7 @@
+ 	if (!rsp_count && !cstate) {
+ 		// found nothing
+ 		buf->data_size = 0;
+-		sdp_append_to_buf(buf, tmpbuf.data, tmpbuf.data_size);
++		sdpd_append_to_buf(buf, tmpbuf.data, tmpbuf.data_size);
+ 		sdp_set_cstate_pdu(buf, NULL);
+ 	}
+ 
+@@ -871,10 +1066,21 @@
+ 	sdp_pdu_hdr_t *reqhdr = (sdp_pdu_hdr_t *)req->buf;
+ 	sdp_pdu_hdr_t *rsphdr;
+ 	sdp_buf_t rsp;
+-	uint8_t *buf = malloc(USHRT_MAX);
++	uint8_t *buf;
+ 	int sent = 0;
+ 	int status = SDP_INVALID_SYNTAX;
+ 
++	if (req->len < (int) sizeof(sdp_pdu_hdr_t)) {
++		free(req->buf);
++		return;
++	}
++
++	buf = malloc(USHRT_MAX);
++	if (!buf) {
++		free(req->buf);
++		return;
++	}
++
+ 	memset(buf, 0, USHRT_MAX);
+ 	rsp.data = buf + sizeof(sdp_pdu_hdr_t);
+ 	rsp.data_size = 0;
+--- a/sdpd/server.c
++++ b/sdpd/server.c
+@@ -163,7 +163,7 @@
+ 	}
+ 
+ 	len = recv(sk, &hdr, sizeof(sdp_pdu_hdr_t), MSG_PEEK);
+-	if (len <= 0) {
++	if (len < 0 || (unsigned int) len < sizeof(sdp_pdu_hdr_t)) {
+ 		sdp_svcdb_collect_all(sk);
+ 		sdp_cstate_cleanup(sk);
+ 		return FALSE;
+@@ -176,6 +176,7 @@
+ 
+ 	len = recv(sk, buf, size, 0);
+ 	if (len <= 0) {
++		free(buf);
+ 		sdp_svcdb_collect_all(sk);
+ 		sdp_cstate_cleanup(sk);
+ 		return FALSE;
+--- a/sdpd/service.c
++++ b/sdpd/service.c
+@@ -519,9 +519,15 @@
+ 	uint8_t *p = req->buf + sizeof(sdp_pdu_hdr_t);
+ 	int bufsize = req->len - sizeof(sdp_pdu_hdr_t);
+ 	sdp_record_t *rec;
++
++	if (bufsize < (int) sizeof(uint8_t))
++		goto invalid;
+ 
+ 	req->flags = *p++;
++	bufsize -= sizeof(uint8_t);
+ 	if (req->flags & SDP_DEVICE_RECORD) {
++		if (bufsize < (int) sizeof(bdaddr_t))
++			goto invalid;
+ 		bacpy(&req->device, (bdaddr_t *) p);
+ 		p += sizeof(bdaddr_t);
+ 		bufsize -= sizeof(bdaddr_t);
+@@ -588,8 +594,15 @@
+ 	int status = 0, scanned = 0;
+ 	uint8_t *p = req->buf + sizeof(sdp_pdu_hdr_t);
+ 	int bufsize = req->len - sizeof(sdp_pdu_hdr_t);
+-	uint32_t handle = ntohl(bt_get_unaligned((uint32_t *) p));
++	uint32_t handle;
+ 
++	if (bufsize < (int) sizeof(uint32_t)) {
++		status = SDP_INVALID_SYNTAX;
++		goto done;
++	}
++
++	handle = ntohl(bt_get_unaligned((uint32_t *) p));
++
+ 	debug("Svc Rec Handle: 0x%x", handle);
+ 
+ 	p += sizeof(uint32_t);
+@@ -606,7 +619,7 @@
+ 			update_svclass_list();
+ 		} else {
+ 			debug("SvcRecHandle : 0x%x", handle);
+-			debug("SvcRecHandleNew : 0x%x", nrec->handle);
++			debug("SvcRecHandleNew : 0x%x", nrec ? nrec->handle : 0);
+ 			debug("SvcRecNew : %p", nrec);
+ 			debug("SvcRecOld : %p", orec);
+ 			debug("Failure to update, restore old value");
+@@ -618,6 +631,7 @@
+ 	} else
+ 		status = SDP_INVALID_RECORD_HANDLE;
+ 
++done:
+ 	p = rsp->data;
+ 	bt_put_unaligned(htons(status), (uint16_t *) p);
+ 	rsp->data_size = sizeof(uint16_t);
+@@ -630,10 +644,19 @@
+ int service_remove_req(sdp_req_t *req, sdp_buf_t *rsp)
+ {
+ 	uint8_t *p = req->buf + sizeof(sdp_pdu_hdr_t);
+-	uint32_t handle = ntohl(bt_get_unaligned((uint32_t *) p));
++	uint32_t handle;
+ 	sdp_record_t *rec;
+ 	int status = 0;
+ 
++	if (req->len - (int) sizeof(sdp_pdu_hdr_t) < (int) sizeof(uint32_t)) {
++		p = rsp->data;
++		bt_put_unaligned(htons(SDP_INVALID_SYNTAX), (uint16_t *) p);
++		rsp->data_size = sizeof(uint16_t);
++		return SDP_INVALID_SYNTAX;
++	}
++
++	handle = ntohl(bt_get_unaligned((uint32_t *) p));
++
+ 	/* extract service record handle */
+ 	p += sizeof(uint32_t);
+ 

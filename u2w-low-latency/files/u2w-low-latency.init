@@ -1,0 +1,26 @@
+#!/bin/sh
+# U2W low-latency runtime settings, started once from start_main_service.sh.
+# - No deep CPU idle: LOW-POWER-IDLE (~300 us exit) delays every SDIO/USB interrupt; WAIT stays.
+# - Daemons off the A/V path run at nice 19; AppleCarPlay, fakeiOSDevice, ARMadb-driver and
+#   ARMiPhoneIAP2 keep their own (partly real-time) priorities.
+# - cdc_ncm (head unit after a USB role switch) sends every frame at once (no 400 us batching).
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+case "${1:-}" in
+  start)
+    for s in /sys/devices/system/cpu/cpu0/cpuidle/state[2-9]; do
+        [ -e "$s/disable" ] && echo 1 > "$s/disable"
+    done
+    # Daemons and their restarts appear late; the loop is cheap (one ps every 30 s).
+    (while :; do
+        for p in $(pidof riddle_top boa colorLightDaemon udhcpd) \
+                 $(ps | awk '/check_log_size\.sh|cpu_UsageRate\.sh/ && !/awk/ {print $1}'); do
+            renice -n 19 -p "$p" >/dev/null 2>&1
+        done
+        for t in /sys/class/net/*/cdc_ncm/tx_timer_usecs; do
+            [ -e "$t" ] && echo 0 > "$t"
+        done
+        sleep 30
+    done) </dev/null >/dev/null 2>&1 &
+    ;;
+  *) echo 'Usage: /etc/init.d/u2w-low-latency start' >&2; exit 2;;
+esac

@@ -1,0 +1,337 @@
+U2W: Carlinkit vendor hostapd contract
+
+Makes this hostapd a drop-in for the vendor /usr/sbin/hostapd used by the closed CarPlay daemons:
+- parses the unchanged vendor /etc/hostapd.conf (WPS-only device_name/manufacturer accepted and
+  ignored in this non-WPS build);
+- builds the Apple CarPlay IE (OUI 00:A0:40) like the vendor RTL 0.8.x and BCM v2.7 hostapds and
+  adds it to beacons, probe responses and association responses, unless vendor_elements or
+  assocresp_elements are configured. The Bluetooth MAC is retried from hci0 for 30 s and the
+  beacon refreshed once known. Deviation: the attribute-0 band bit follows the configured band
+  (the vendor hard-codes 5 GHz);
+- writes /tmp/wifi_status (pair_start / pair_success / disconnected) and /tmp/wifi_connection_list
+  with the vendor shell commands at association, authorization and station removal.
+Prior art: u2w-build/CARPLAY-HOSTAPD-SOURCES.md.
+
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -73,6 +73,7 @@
+ OBJS += ../src/ap/eap_user_db.o
+ OBJS += ../src/ap/ieee802_11_auth.o
+ OBJS += ../src/ap/sta_info.o
++OBJS += ../src/ap/u2w_vendor.o
+ OBJS += ../src/ap/wpa_auth.o
+ OBJS += ../src/ap/tkip_countermeasures.o
+ OBJS += ../src/ap/ap_mlme.o
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -4178,6 +4178,11 @@
+ 		bss->wps_nfc_pw_from_config = 1;
+ #endif /* CONFIG_WPS_NFC */
+ #endif /* CONFIG_WPS */
++#ifndef CONFIG_WPS
++	} else if (os_strcmp(buf, "device_name") == 0 ||
++		   os_strcmp(buf, "manufacturer") == 0) {
++		/* U2W: WPS-only keys in the vendor /etc/hostapd.conf; ignored without WPS. */
++#endif /* CONFIG_WPS */
+ #ifdef CONFIG_P2P_MANAGER
+ 	} else if (os_strcmp(buf, "manage_p2p") == 0) {
+ 		if (atoi(pos))
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -24,6 +24,7 @@
+ #include "eapol_auth/eapol_auth_sm_i.h"
+ #include "fst/fst.h"
+ #include "hostapd.h"
++#include "u2w_vendor.h"
+ #include "authsrv.h"
+ #include "sta_info.h"
+ #include "accounting.h"
+@@ -733,6 +734,7 @@
+  */
+ static void hostapd_cleanup(struct hostapd_data *hapd)
+ {
++	u2w_carplay_ie_deinit(hapd);
+ 	wpa_printf(MSG_DEBUG, "%s(hapd=%p (%s))", __func__, hapd,
+ 		   hapd->conf ? hapd->conf->iface : "N/A");
+ 	if (hapd->iface->interfaces &&
+@@ -1584,6 +1586,8 @@
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
++	u2w_carplay_ie_setup(hapd);
++
+ 	if (conf->wmm_enabled < 0)
+ 		conf->wmm_enabled = hapd->iconf->ieee80211n |
+ 			hapd->iconf->ieee80211ax;
+@@ -4179,6 +4183,9 @@
+ 		return;
+ 	}
+ 
++	/* U2W: both hostapd-SME (handle_assoc_cb) and driver-SME (hostapd_notif_assoc) land here. */
++	u2w_sta_assoc(sta->addr);
++
+ #ifdef CONFIG_IEEE80211BE
+ 	if (ap_sta_is_mld(hapd, sta) &&
+ 	    sta->mld_assoc_link_id != hapd->mld_link_id)
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -196,6 +196,8 @@
+ 	struct hostapd_iface *iface;
+ 	struct hostapd_config *iconf;
+ 	struct hostapd_bss_config *conf;
++	int u2w_carplay_ie; /* U2W: vendor/assocresp elements are our CarPlay IE */
++	int u2w_bt_tries;
+ 	int interface_added; /* virtual interface added for this BSS */
+ 	unsigned int started:1;
+ 	unsigned int disabled:1;
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -37,6 +37,7 @@
+ #include "mbo_ap.h"
+ #include "ndisc_snoop.h"
+ #include "sta_info.h"
++#include "u2w_vendor.h"
+ #include "vlan.h"
+ #include "wps_hostapd.h"
+ 
+@@ -287,6 +288,9 @@
+ 
+ 	accounting_sta_stop(hapd, sta);
+ 
++	/* U2W: associated but never authorized stations leave the list too. */
++	u2w_sta_left(sta->addr);
++
+ 	/* just in case */
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	hostapd_set_sta_flags(hapd, sta);
+@@ -1780,6 +1784,12 @@
+ #endif /* CONFIG_P2P */
+ 	const u8 *ip_ptr = NULL;
+ 
++	/* U2W: this is where AP-STA-CONNECTED / AP-STA-DISCONNECTED are emitted. */
++	if (authorized)
++		u2w_sta_authorized(sta->addr);
++	else
++		u2w_sta_left(sta->addr);
++
+ #ifdef CONFIG_P2P
+ 	if (hapd->p2p_group == NULL) {
+ 		if (sta->p2p_ie != NULL &&
+--- a/src/ap/u2w_carplay_ie.h
++++ b/src/ap/u2w_carplay_ie.h
+@@ -0,0 +1,43 @@
++/*
++ * U2W: Apple wireless CarPlay "Apple Device" vendor IE, built like the Carlinkit vendor hostapds
++ * (2021 Realtek 0.8.x, 2024 Broadcom v2.7): OUI 00:A0:40 type 0, 47-byte body, Bluetooth (hci0)
++ * and Wi-Fi MACs patched in. Attributes: 0 flags, 2 manufacturer "Magic", 3 model "AutoBox",
++ * 4 manufacturer OUI 06:06:06, 6 Bluetooth MAC, 7 device ID (Wi-Fi MAC).
++ * Deviation from the vendor bytes: attr 0's band bit (0x01 = 5 GHz, 0x02 = 2.4 GHz) follows the
++ * configured band; the vendor hard-codes 0x2021 even after start_bluetooth_wifi.sh moves the AP
++ * to channel 6. 0x20 (wireless CarPlay) and the 0x2000 bit stay as in the vendor template.
++ * Header-only so the byte layout can be unit-tested on the build host.
++ */
++#ifndef U2W_CARPLAY_IE_H
++#define U2W_CARPLAY_IE_H
++
++#include <string.h>
++
++#define U2W_CARPLAY_IE_LEN 49 /* element id + length + 0x2f body */
++#define U2W_CARPLAY_BAND_5GHZ 0x01
++#define U2W_CARPLAY_BAND_2GHZ 0x02
++
++static inline size_t u2w_carplay_ie(unsigned char *out, const unsigned char bt[6],
++				    const unsigned char wifi[6], unsigned char band)
++{
++	static const unsigned char head[] = {
++		0xdd, 0x2f, 0x00, 0xa0, 0x40, 0x00,	/* vendor IE, Apple OUI, type 0 */
++		0x00, 0x02, 0x20, 0x20,			/* attr 0: flags 0x2020 | band */
++		0x02, 0x06, 'M', 'a', 'g', 'i', 'c', 0x00,	/* attr 2: manufacturer */
++		0x03, 0x08, 'A', 'u', 't', 'o', 'B', 'o', 'x', 0x00, /* attr 3: model */
++		0x04, 0x03, 0x06, 0x06, 0x06,		/* attr 4: manufacturer OUI */
++		0x06, 0x06,				/* attr 6: Bluetooth MAC */
++	};
++	size_t n = sizeof(head);
++
++	memcpy(out, head, n);
++	out[9] |= band;
++	memcpy(out + n, bt, 6);
++	n += 6;
++	out[n++] = 0x07;			/* attr 7: device ID = Wi-Fi MAC */
++	out[n++] = 0x06;
++	memcpy(out + n, wifi, 6);
++	return n + 6;
++}
++
++#endif /* U2W_CARPLAY_IE_H */
+--- a/src/ap/u2w_vendor.c
++++ b/src/ap/u2w_vendor.c
+@@ -0,0 +1,153 @@
++/*
++ * U2W: the Carlinkit vendor hostapd contract, so this hostapd is a drop-in for the closed
++ * CarPlay daemons:
++ *  - the Apple CarPlay IE in beacons, probe responses and association responses, unless
++ *    vendor_elements / assocresp_elements are configured;
++ *  - /tmp/wifi_status and /tmp/wifi_connection_list (read by AppleCarPlay, ARMadb-driver and
++ *    the web UI), written with the same shell commands as the vendor binaries.
++ */
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "utils/eloop.h"
++#include "utils/wpabuf.h"
++#include "hostapd.h"
++#include "ap_config.h"
++#include "beacon.h"
++#include "u2w_carplay_ie.h"
++#include "u2w_vendor.h"
++
++#define U2W_BT_ADDR "/sys/class/bluetooth/hci0/address"
++#define U2W_LIST "/tmp/wifi_connection_list"
++#define U2W_STATUS "/tmp/wifi_status"
++#define U2W_BT_RETRIES 30 /* hci0 can come up after hostapd; retry once a second */
++
++/* Template Bluetooth MAC of the vendor IE, used until hci0 reports its address. */
++static const u8 u2w_bt_template[ETH_ALEN] = { 0x00, 0x1a, 0x7d, 0xda, 0x71, 0x0a };
++
++static void u2w_run(const char *cmd)
++{
++	int ret = system(cmd);
++
++	if (ret != 0)
++		wpa_printf(MSG_DEBUG, "carplay: '%s' returned %d", cmd, ret);
++}
++
++static int u2w_read_bt_addr(u8 *addr)
++{
++	char buf[32];
++	FILE *f = fopen(U2W_BT_ADDR, "r");
++	int ok;
++
++	if (!f)
++		return -1;
++	ok = fgets(buf, sizeof(buf), f) && hwaddr_aton(buf, addr) == 0 &&
++		!is_zero_ether_addr(addr);
++	fclose(f);
++	return ok ? 0 : -1;
++}
++
++static int u2w_ours(struct hostapd_data *hapd)
++{
++	return hapd->u2w_carplay_ie;
++}
++
++static void u2w_set_ie(struct hostapd_data *hapd, const u8 *bt, int log)
++{
++	u8 ie[U2W_CARPLAY_IE_LEN];
++	size_t len;
++	int i;
++
++	if (log) {
++		printf("Add Carplay Information Element!!!!\n");
++		for (i = 0; i < ETH_ALEN; i++)
++			printf("Carplay Information Element Set bluetooth mac: %02x\n", bt[i]);
++		for (i = 0; i < ETH_ALEN; i++)
++			printf("Carplay Information Element Set Wifi mac: %02x\n",
++			       hapd->own_addr[i]);
++		fflush(stdout);
++	}
++	len = u2w_carplay_ie(ie, bt, hapd->own_addr,
++			     hapd->iconf->hw_mode == HOSTAPD_MODE_IEEE80211A ?
++			     U2W_CARPLAY_BAND_5GHZ : U2W_CARPLAY_BAND_2GHZ);
++	wpabuf_free(hapd->conf->vendor_elements);
++	wpabuf_free(hapd->conf->assocresp_elements);
++	hapd->conf->vendor_elements = wpabuf_alloc_copy(ie, len);
++	hapd->conf->assocresp_elements = wpabuf_alloc_copy(ie, len);
++}
++
++static void u2w_bt_retry(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	u8 bt[ETH_ALEN];
++
++	if (!u2w_ours(hapd))
++		return;
++	if (u2w_read_bt_addr(bt) == 0) {
++		u2w_set_ie(hapd, bt, 1);
++		ieee802_11_set_beacon(hapd);
++		return;
++	}
++	if (++hapd->u2w_bt_tries < U2W_BT_RETRIES) {
++		eloop_register_timeout(1, 0, u2w_bt_retry, hapd, NULL);
++		return;
++	}
++	wpa_printf(MSG_INFO, "carplay: no Bluetooth address in " U2W_BT_ADDR
++		   "; CarPlay IE keeps the template MAC");
++	u2w_set_ie(hapd, u2w_bt_template, 1);
++	ieee802_11_set_beacon(hapd);
++}
++
++void u2w_carplay_ie_setup(struct hostapd_data *hapd)
++{
++	u8 bt[ETH_ALEN];
++
++	if (hapd->conf->vendor_elements || hapd->conf->assocresp_elements) {
++		if (!u2w_ours(hapd))
++			return; /* configured explicitly: leave it alone */
++	}
++	hapd->u2w_carplay_ie = 1;
++	if (u2w_read_bt_addr(bt) == 0) {
++		u2w_set_ie(hapd, bt, 1);
++		return;
++	}
++	/* Beacon with the template MAC now, the real one as soon as hci0 has it. */
++	u2w_set_ie(hapd, u2w_bt_template, 0);
++	hapd->u2w_bt_tries = 0;
++	eloop_cancel_timeout(u2w_bt_retry, hapd, NULL);
++	eloop_register_timeout(1, 0, u2w_bt_retry, hapd, NULL);
++}
++
++void u2w_carplay_ie_deinit(struct hostapd_data *hapd)
++{
++	eloop_cancel_timeout(u2w_bt_retry, hapd, NULL);
++}
++
++static void u2w_list_remove(const u8 *addr, const char *then)
++{
++	char cmd[200];
++
++	os_snprintf(cmd, sizeof(cmd), "grep -q " MACSTR " " U2W_LIST " && { sed -i '/"
++		    MACSTR "/d' " U2W_LIST "%s; }", MAC2STR(addr), MAC2STR(addr), then);
++	u2w_run(cmd);
++}
++
++void u2w_sta_assoc(const u8 *addr)
++{
++	char cmd[100];
++
++	u2w_list_remove(addr, "");
++	os_snprintf(cmd, sizeof(cmd), "echo " MACSTR " >> " U2W_LIST, MAC2STR(addr));
++	u2w_run(cmd);
++	u2w_run("echo pair_start > " U2W_STATUS);
++}
++
++void u2w_sta_authorized(const u8 *addr)
++{
++	u2w_run("echo pair_success > " U2W_STATUS);
++}
++
++void u2w_sta_left(const u8 *addr)
++{
++	/* Only stations still listed report "disconnected", so repeated calls are no-ops. */
++	u2w_list_remove(addr, "; echo disconnected > " U2W_STATUS);
++}
+--- a/src/ap/u2w_vendor.h
++++ b/src/ap/u2w_vendor.h
+@@ -0,0 +1,13 @@
++/* U2W: Carlinkit vendor hostapd contract (CarPlay IE, /tmp/wifi_* status files). */
++#ifndef U2W_VENDOR_H
++#define U2W_VENDOR_H
++
++struct hostapd_data;
++
++void u2w_carplay_ie_setup(struct hostapd_data *hapd);
++void u2w_carplay_ie_deinit(struct hostapd_data *hapd);
++void u2w_sta_assoc(const u8 *addr);
++void u2w_sta_authorized(const u8 *addr);
++void u2w_sta_left(const u8 *addr);
++
++#endif /* U2W_VENDOR_H */

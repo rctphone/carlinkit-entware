@@ -1,0 +1,149 @@
+mDNSCore: Carlinkit per-interface service filter (port of the vendor mdnsd patch).
+
+Vendor 878.270.2 behaviour, from its disassembly:
+- SendResponses remembers the escaped name of the last SRV record in the SendRNow setup
+  loop; per interface pass, if the filter matches, every record due on that interface in
+  the first (answer) pass moves on to the next interface instead of being sent.
+- SendQueries remembers the escaped qname of the last question advanced this round; per
+  interface pass, if the filter matches, the packet built for that interface is dropped.
+- Filter (strstr on name and interface): responses skip _airplay._tcp on usb0 and
+  _carplay-ctrl._tcp on wlan0/ncm0; queries skip _carplay-ctrl._tcp on usb0 and
+  _airplay._tcp on wlan0/ncm0; both skip either service on lo. It logs
+  "Skip SendResponses|SendQueries service:<name> on <ifname>".
+Differences: the remembered name starts empty (vendor: uninitialised stack), and a
+dropped query packet releases its leftover known-answer list instead of handing it to
+the next interface.
+
+--- a/mDNSCore/mDNS.c
++++ b/mDNSCore/mDNS.c
+@@ -69,6 +69,7 @@
+ #endif
+ 
+ #include "mdns_strict.h"
++#include <string.h>                     // strstr() for the Carlinkit service filter
+ 
+ // Forward declarations
+ extern mDNS mDNSStorage; // NOLINT(misc-uninitialized-record-variable): Initialized by mDNS_InitStorage().
+@@ -2944,6 +2945,33 @@ mDNSlocal mDNSu32 DetermineOwnerRecordSpace(const NetworkInterfaceInfo *const in
+ // Older records cannot have their timelines accelerated; this would just widen
+ // the gap between them and their younger bretheren and get them even more out of sync.
+ 
++// Carlinkit per-interface service filter, ported from the vendor mdnsd (mDNSResponder-878.270.2 + vendor
++// patch). The dongle talks CarPlay control to the phone side and AirPlay to the head-unit side, so:
++//   SendResponses: no _airplay._tcp on usb0, no _carplay-ctrl._tcp on wlan0/ncm0;
++//   SendQueries:   no _carplay-ctrl._tcp on usb0, no _airplay._tcp on wlan0/ncm0;
++//   both:          neither service on lo.
++// Matching is substring (strstr) on the escaped name and on the interface name, as in the vendor build.
++// The vendor decides once per interface pass from one name per call (see the callers); a match drops
++// what that pass would have sent on the interface.
++mDNSlocal mDNSBool CarlinkitSkipServiceOnInterface(const char *const name, const char *const ifname, const mDNSBool isQuery)
++{
++    static const char kCarPlayCtrl[] = "_carplay-ctrl._tcp";
++    static const char kAirPlay[]     = "_airplay._tcp";
++    mDNSBool skip = mDNSfalse;
++
++    if (!name[0]) return mDNSfalse;
++    if (strstr(name, isQuery ? kCarPlayCtrl : kAirPlay) && strstr(ifname, "usb0"))
++        skip = mDNStrue;
++    else if (strstr(name, isQuery ? kAirPlay : kCarPlayCtrl) && (strstr(ifname, "wlan0") || strstr(ifname, "ncm0")))
++        skip = mDNStrue;
++    if ((strstr(name, kCarPlayCtrl) || strstr(name, kAirPlay)) && strstr(ifname, "lo"))
++        skip = mDNStrue;
++    if (skip)
++        LogMsgWithLevel(mDNSNULL, MDNS_LOG_DEFAULT, "Skip %s service:%s on %s",   // vendor text, no category
++            isQuery ? "SendQueries" : "SendResponses", name, ifname);
++    return skip;
++}
++
+ // Note: SendResponses calls mDNS_Deregister_internal which can call a user callback, which may change
+ // the record list and/or question list.
+ // Any code walking either list must use the CurrentQuestion and/or CurrentRecord mechanism to protect against this.
+@@ -2953,6 +2981,7 @@ mDNSlocal void SendResponses(mDNS *const m)
+     AuthRecord *rr, *r2;
+     mDNSs32 maxExistingAnnounceInterval = 0;
+     const NetworkInterfaceInfo *intf = GetFirstActiveInterface(m->HostInterfaces);
++    char carlinkitName[MAX_ESCAPED_DOMAIN_NAME] = "";   // Name of the last SRV record seen below (vendor filter)
+ 
+     m->NextScheduledResponse = m->timenow + FutureTime;
+ 
+@@ -3151,6 +3180,8 @@ mDNSlocal void SendResponses(mDNS *const m)
+             rr->LastMCInterface = rr->ImmedAnswer;
+         }
+         SetNextAnnounceProbeTime(m, rr);
++        if (rr->resrec.rrtype == kDNSType_SRV)
++            mDNS_snprintf(carlinkitName, sizeof(carlinkitName), "%##s", rr->resrec.name->c);
+         //if (rr->SendRNow) LogMsg("%-15.4a %s", &rr->v4Requester, ARDisplayString(m, rr));
+     }
+ 
+@@ -3170,6 +3201,7 @@ mDNSlocal void SendResponses(mDNS *const m)
+         int numAnswer   = 0;
+         mDNSu8 *responseptr = m->omsg.data;
+         mDNSu8 *newptr;
++        const mDNSBool carlinkitSkip = CarlinkitSkipServiceOnInterface(carlinkitName, intf->ifname, mDNSfalse);
+         InitializeDNSMessage(&m->omsg.h, zeroID, ResponseFlags);
+ 
+         // First Pass. Look for:
+@@ -3180,9 +3212,10 @@ mDNSlocal void SendResponses(mDNS *const m)
+         {
+ 
+             // Skip this interface if the record InterfaceID is *Any and the record is not
+-            // appropriate for the interface type.
++            // appropriate for the interface type, or if the Carlinkit filter rejects this interface.
+             if ((rr->SendRNow == intf->InterfaceID) &&
+-                ((rr->resrec.InterfaceID == mDNSInterface_Any) && !mDNSPlatformValidRecordForInterface(rr, intf->InterfaceID)))
++                (((rr->resrec.InterfaceID == mDNSInterface_Any) && !mDNSPlatformValidRecordForInterface(rr, intf->InterfaceID)) ||
++                 carlinkitSkip))
+             {
+                 rr->SendRNow = GetNextActiveInterfaceID(intf);
+             }
+@@ -4071,6 +4104,7 @@ mDNSlocal void SendQueries(mDNS *const m)
+     mDNSs32 maxExistingQuestionInterval = 0;
+     const NetworkInterfaceInfo *intf = GetFirstActiveInterface(m->HostInterfaces);
+     CacheRecord *KnownAnswerList = mDNSNULL;
++    char carlinkitName[MAX_ESCAPED_DOMAIN_NAME] = "";   // Name of the last question advanced below (vendor filter)
+ 
+     // 1. If time for a query, work out what we need to do
+ 
+@@ -4195,6 +4229,7 @@ mDNSlocal void SendQueries(mDNS *const m)
+                     q->SendQNow = mDNSInterfaceMark;
+                     q->ThisQInterval *= QuestionIntervalStep;
+                 }
++                mDNS_snprintf(carlinkitName, sizeof(carlinkitName), "%##s", q->qname.c);
+ 
+                 debugf("SendQueries: %##s (%s) next interval %d seconds RequestUnicast = %d",
+                        q->qname.c, DNSTypeName(q->qtype), q->ThisQInterval / InitialQuestionInterval, q->RequestUnicast);
+@@ -4341,6 +4376,7 @@ mDNSlocal void SendQueries(mDNS *const m)
+         TSROptData *newTSROpt;
+         mDNSu16 tsrOptsCount = 0;
+         mDNSu32 tsrHeaderSpace = (OwnerRecordSpace || TraceRecordSpace) ? 0 : DNSOpt_Header_Space;
++        const mDNSBool carlinkitSkip = CarlinkitSkipServiceOnInterface(carlinkitName, intf->ifname, mDNStrue);
+ 
+         InitializeDNSMessage(&m->omsg.h, zeroID, QueryFlags);
+         if (KnownAnswerList) verbosedebugf("SendQueries:   KnownAnswerList set... Will continue from previous packet");
+@@ -4534,7 +4570,7 @@ mDNSlocal void SendQueries(mDNS *const m)
+             }
+         }
+ 
+-        if (queryptr > m->omsg.data)
++        if (queryptr > m->omsg.data && !carlinkitSkip)
+         {
+             // If we have data to send, add OWNER/TRACER/OWNER+TRACER option if necessary, then send packet
+             if (OwnerRecordSpace || TraceRecordSpace || !SLIST_EMPTY(&tsrOpts))
+@@ -4606,9 +4642,16 @@ mDNSlocal void SendQueries(mDNS *const m)
+             // There might be more records left in the known answer list, or more questions to send
+             // on this interface, so go around one more time and try again.
+         }
+-        else    // Nothing more to send on this interface; go to next
++        else    // Nothing more to send on this interface (or the Carlinkit filter dropped it); go to next
+         {
+             const NetworkInterfaceInfo *next = GetFirstActiveInterface(intf->next);
++            // A dropped packet must not hand its leftover known answers to the next interface.
++            while (KnownAnswerList)
++            {
++                CacheRecord *ka = KnownAnswerList;
++                KnownAnswerList = ka->NextInKAList;
++                ka->NextInKAList = mDNSNULL;
++            }
+             intf = next;
+         }
+         TSRDataRecPtrHeadFreeList(&tsrOpts);

@@ -1,0 +1,9 @@
+#!/bin/sh
+# U2W "logcat": there is no Android logd. Show the vendor RAM log instead, so that
+# "adb logcat" works. Arguments are accepted and ignored; -d dumps and exits.
+log=/tmp/userspace.log
+test -e "$log" || log=/tmp/adb.log
+for arg in "$@"; do
+    [ "$arg" = -d ] && exec cat "$log"
+done
+exec tail -n 200 -f "$log"

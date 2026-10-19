@@ -1,0 +1,56 @@
+From: U2W build
+Subject: [PATCH] aacdec: bound the error-path output clear to one frame and timeDataSize bytes
+
+0.1.5 moved decoding into the internal pcmOutputBuffer and, when a call
+returns no valid output (IS_OUTPUT_VALID false: AAC_DEC_NOT_ENOUGH_BITS,
+TRANSPORT_SYNC_ERROR, NEED_TO_RESTART, UNKNOWN, OUTPUT_BUFFER_TOO_SMALL,
+init/unsupported errors), clears the caller buffer with
+  FDKmemclear(pTimeData_extern, timeDataSize_extern*sizeof(INT_PCM));
+0.1.4 (the vendor library) never wrote the caller buffer on that path.
+
+AppleCarPlay passes timeDataSize in BYTES (its mDataByteSize), with a buffer
+of channelConfig*aacSamplesPerFrame*2 bytes, so the upstream clear writes
+twice the buffer: a heap overflow on every DecodeFrame call that returns an
+error (e.g. NOT_ENOUGH_BITS after a short/missing packet).
+
+Audit of every write to pTimeData_extern / use of timeDataSize_extern in
+0.1.6 aacDecoder_DecodeFrame (all other decoding writes only the internal
+pcmOutputBuffer, sized by sizeof(self->pcmOutputBuffer)):
+ 1. timeDataSize_extern < numChannels*frameSize -> OUTPUT_BUFFER_TOO_SMALL:
+    a samples-vs-bytes check; for a byte-counting caller it is laxer, never
+    stricter, so it cannot reject AppleCarPlay frames.
+ 2. valid output: memcpy of numChannels*frameSize samples -- exactly the
+    samples 0.1.4 decoded in place into the same buffer, so no write beyond
+    what the vendor library already did for the same stream.
+ 3. invalid output: the clear fixed here.
+
+The clear now covers at most one frame (numChannels*frameSize samples, the
+footprint of path 2) and at most timeDataSize_extern bytes, so it stays
+inside the buffer whether the caller counts samples or bytes.  Callers that
+pass samples still get the whole frame region zeroed whenever their buffer
+holds two frames' worth of samples, otherwise its first timeDataSize bytes;
+output is undefined on these errors anyway (0.1.4 left it untouched), and
+AppleCarPlay itself zeroes channelConfig*aacSamplesPerFrame*2 bytes on error.
+Before the first decoded frame numChannels*frameSize is 0 and nothing is
+written, as in 0.1.4.
+
+--- a/libAACdec/src/aacdecoder_lib.cpp
++++ b/libAACdec/src/aacdecoder_lib.cpp
+@@ -1062,7 +1062,16 @@
+       FDKmemcpy(pTimeData_extern, pTimeData, self->streamInfo.numChannels*self->streamInfo.frameSize*sizeof(*pTimeData));
+     }
+     else {
+-      FDKmemclear(pTimeData_extern, timeDataSize_extern*sizeof(*pTimeData_extern));
++      /* Clear no more than one decoded frame, and no more than timeDataSize_extern
++         bytes: callers that pass the buffer size in bytes instead of samples
++         (fdk-aac <= 0.1.4 never wrote on this path) must not be overrun. */
++      INT clearBytes = self->streamInfo.numChannels*self->streamInfo.frameSize*(INT)sizeof(*pTimeData_extern);
++      if (clearBytes > timeDataSize_extern) {
++        clearBytes = timeDataSize_extern;
++      }
++      if (clearBytes > 0) {
++        FDKmemclear(pTimeData_extern, clearBytes);
++      }
+     }
+ 
+     return ErrorStatus;

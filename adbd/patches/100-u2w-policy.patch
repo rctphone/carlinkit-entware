@@ -1,0 +1,11 @@
+--- a/adb/services.c
++++ b/adb/services.c
+@@ -302,7 +302,7 @@
+ #if ADB_HOST
+ #define SHELL_COMMAND "/bin/sh"
+ #else
+-#define SHELL_COMMAND "/system/bin/sh"
++#define SHELL_COMMAND "/bin/sh"
+ #endif
+ 
+ #if !ADB_HOST

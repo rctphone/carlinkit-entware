@@ -1,0 +1,90 @@
+From: U2W build
+Subject: [PATCH] sbrdec: reject out-of-range LD-SBR transient positions
+
+extractLowDelayGrid reads a 4-bit transient position for 15 and 16 time
+slots, but FDK_sbrDecoder_envelopeTable_15 has only 15 rows, so position 15
+indexes past the table (ASan global-buffer-overflow on corrupted AAC-ELD
+frames, also present in 0.1.4); the number of envelopes then comes from the
+neighbouring table and drives writes into FRAME_INFO.borders[].  Backport of
+the upstream fdk-aac 2.0 check: generateFixFixOnly fails for
+tranPosInternal >= numberTimeSlots (and for an unknown slot count instead
+of dereferencing NULL), and the failure propagates as a bitstream error
+through extractLowDelayGrid/extractFrameInfo, which the SBR decoder already
+handles by concealment.
+
+--- a/libSBRdec/src/env_extr.cpp
++++ b/libSBRdec/src/env_extr.cpp
+@@ -882,16 +882,21 @@
+ /*!
+   \brief    Generates frame info for FIXFIXonly frame class used for low delay version
+ 
+-  \return   nothing
++  \return   zero for an invalid transient position, one otherwise
+  ****************************************************************************/
+- static void generateFixFixOnly ( FRAME_INFO *hSbrFrameInfo,
+-                                  int tranPosInternal,
+-                                  int numberTimeSlots
+-                                )
++ static int generateFixFixOnly ( FRAME_INFO *hSbrFrameInfo,
++                                 int tranPosInternal,
++                                 int numberTimeSlots
++                               )
+ {
+     int nEnv, i, tranIdx;
+     const int *pTable;
+ 
++    /* The tables have numberTimeSlots rows; a 4-bit position can exceed 15 rows. */
++    if (tranPosInternal >= numberTimeSlots) {
++      return 0;
++    }
++
+     switch (numberTimeSlots) {
+         case 8:
+             pTable = FDK_sbrDecoder_envelopeTable_8[tranPosInternal];
+@@ -903,10 +908,7 @@
+             pTable = FDK_sbrDecoder_envelopeTable_16[tranPosInternal];
+             break;
+         default:
+-            FDK_ASSERT(0);
+-            /* in case assertion checks are disabled, force a definite memory fault at first access */
+-            pTable = NULL;
+-            break;
++            return 0;
+     }
+ 
+     /* look number of envelopes in table */
+@@ -928,6 +930,8 @@
+     hSbrFrameInfo->bordersNoise[2] = numberTimeSlots;
+     /* nEnv is always > 1, so nNoiseEnvelopes is always 2 (IEC 14496-3 4.6.19.3.2) */
+     hSbrFrameInfo->nNoiseEnvelopes = 2;
++
++    return 1;
+ }
+ 
+ /*!
+@@ -967,10 +971,11 @@
+       }
+ 
+       /* calculate borders according to the transient position */
+-      generateFixFixOnly ( pFrameInfo,
+-                           temp,
+-                           numberTimeSlots
+-                         );
++      if ( !generateFixFixOnly ( pFrameInfo,
++                                 temp,
++                                 numberTimeSlots ) ) {
++        return 0;
++      }
+ 
+       /* decode freq res: */
+       for (k = 0; k < pFrameInfo->nEnvelopes; k++) {
+@@ -1007,8 +1012,7 @@
+         /* if frameClass == 1, extract LowDelaySbrGrid, otherwise extract normal SBR-Grid for FIXIFX */
+         /* extract the AACLD-Sbr-Grid */
+         pFrameInfo->frameClass = frameClass;
+-        extractLowDelayGrid (hBs, hHeaderData, h_frame_data, numberTimeSlots);
+-        return 1;
++        return extractLowDelayGrid (hBs, hHeaderData, h_frame_data, numberTimeSlots);
+       }
+   } else
+   {

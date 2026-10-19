@@ -1,0 +1,98 @@
+--- a/hcid/hcid.h
++++ b/hcid/hcid.h
+@@ -191,6 +191,7 @@
+ int read_remote_class(bdaddr_t *local, bdaddr_t *peer, uint32_t *class);
+ int write_device_name(bdaddr_t *local, bdaddr_t *peer, char *name);
+ int read_device_name(bdaddr_t *local, bdaddr_t *peer, char *name);
++int read_remote_eir(bdaddr_t *local, bdaddr_t *peer, char *eir);
+ int write_remote_eir(bdaddr_t *local, bdaddr_t *peer, uint8_t *data);
+ int write_l2cap_info(bdaddr_t *local, bdaddr_t *peer,
+ 			uint16_t mtu_result, uint16_t mtu,
+--- a/hcid/storage.c
++++ b/hcid/storage.c
+@@ -284,7 +284,31 @@
+ 	if (len > 248)
+ 		str[248] = '\0';
+ 	strcpy(name, str);
++
++	free(str);
++
++	return 0;
++}
++
++/* Carlinkit: read back the hex string stored by write_remote_eir(),
++ * truncated like the cached names (248 characters) */
++int read_remote_eir(bdaddr_t *local, bdaddr_t *peer, char *eir)
++{
++	char filename[PATH_MAX + 1], addr[18], *str;
++	int len;
++
++	create_filename(filename, PATH_MAX, local, "eir");
+ 
++	ba2str(peer, addr);
++	str = textfile_get(filename, addr);
++	if (!str)
++		return -ENOENT;
++
++	len = strlen(str);
++	if (len > 248)
++		str[248] = '\0';
++	strcpy(eir, str);
++
+ 	free(str);
+ 
+ 	return 0;
+--- a/hcid/adapter.c
++++ b/hcid/adapter.c
+@@ -4254,7 +4254,43 @@
+ 
+ 	return dbus_message_new_method_return(msg);
+ }
++
++/* Carlinkit: GetDeiceEIR (sic) returns the stored EIR of a remote device as
++ * the hex string kept in <storage>/<local>/eir. Same name, signature and
++ * errors as the vendor hcid; bluetoothDaemon calls it. */
++static DBusMessage *get_device_eir(DBusConnection *conn,
++						DBusMessage *msg, void *data)
++{
++	struct adapter *adapter = data;
++	DBusMessage *reply;
++	const char *peer_addr;
++	bdaddr_t local, peer;
++	char eir[300], *str = eir;
+ 
++	eir[0] = '\0';
++
++	if (!dbus_message_get_args(msg, NULL,
++				DBUS_TYPE_STRING, &peer_addr,
++				DBUS_TYPE_INVALID))
++		return invalid_args(msg);
++
++	str2ba(adapter->address, &local);
++	str2ba(peer_addr, &peer);
++
++	if (read_remote_eir(&local, &peer, eir) != 0)
++		return g_dbus_create_error(msg, ERROR_INTERFACE ".DoesNotExist",
++						"Device EIR not exsit");
++
++	reply = dbus_message_new_method_return(msg);
++	if (!reply)
++		return NULL;
++
++	dbus_message_append_args(reply, DBUS_TYPE_STRING, &str,
++					DBUS_TYPE_INVALID);
++
++	return reply;
++}
++
+ /* BlueZ 4.0 API */
+ static GDBusMethodTable adapter_methods[] = {
+ 	{ "GetProperties",	"",	"a{sv}",get_properties		},
+@@ -4281,6 +4317,7 @@
+ 	{ "RequestAuthorization","su",	"",	request_authorization,
+ 						G_DBUS_METHOD_FLAG_ASYNC},
+ 	{ "CancelAuthorization","",	"",	cancel_authorization	},
++	{ "GetDeiceEIR",	"s",	"s",	get_device_eir		},
+ 	{ }
+ };
+ 

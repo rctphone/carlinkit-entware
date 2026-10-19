@@ -1,0 +1,19 @@
+U2W: the vendor bluetoothDaemon starts "dbus-daemon --system" (and would start a session
+bus without --config-file) against the 1.0-era configs in /etc/dbus-1. Since 1.9 upstream
+reads ${datadir}/dbus-1/{system,session}.conf by default; read the vendor files instead.
+
+--- a/meson.build
++++ b/meson.build
+@@ -933,10 +933,10 @@ config.set_quoted('DBUS_MACHINE_UUID_FIL
+     get_option('prefix') / get_option('localstatedir') / 'lib'/'dbus'/'machine-id'
+ )
+ config.set_quoted('DBUS_SYSTEM_CONFIG_FILE',
+-    get_option('prefix') / get_option('datadir') / 'dbus-1' / 'system.conf'
++    get_option('prefix') / get_option('sysconfdir') / 'dbus-1' / 'system.conf'
+ )
+ config.set_quoted('DBUS_SESSION_CONFIG_FILE',
+-    get_option('prefix') / get_option('datadir') / 'dbus-1' / 'session.conf'
++    get_option('prefix') / get_option('sysconfdir') / 'dbus-1' / 'session.conf'
+ )
+
+

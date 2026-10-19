@@ -1,0 +1,30 @@
+--- a/hcid/dbus-hci.c
++++ b/hcid/dbus-hci.c
+@@ -1094,24 +1094,10 @@
+ 	}
+ 
+ 	info("device->auth=%d type=%d", device->auth, type);
+-
+-	/* If no MITM protection required, auto-accept */
+-	if (!(device->auth & 0x01) && !(type & 0x01)) {
+-		int dd;
+-
+-		dd = hci_open_dev(adapter->dev_id);
+-		if (dd < 0) {
+-			error("Unable to open hci%d", adapter->dev_id);
+-			return -1;
+-		}
+ 
+-		hci_send_cmd(dd, OGF_LINK_CTL,
+-					OCF_USER_CONFIRM_REPLY, 6, dba);
+-
+-		hci_close_dev(dd);
+-
+-		return 0;
+-	}
++	/* Carlinkit: no auto-accept without MITM protection; every user
++	 * confirmation goes to the agent (bluetoothDaemon), like the
++	 * vendor hcid */
+ 
+ 	if (device->agent)
+ 		agent = device->agent;

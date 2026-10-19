@@ -1,0 +1,26 @@
+#!/bin/sh
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+case "${1:-}" in
+    start)
+        /script/start_usb_debug.sh </dev/null >>/tmp/usb-debug-supervisor.log 2>&1 &
+        ;;
+    stop)
+        # The supervisor owns its children; its EXIT trap stops only those children.
+        if [ -s /tmp/usb-debug.pid ]; then
+            pid=$(cat /tmp/usb-debug.pid)
+            case "$pid" in ''|*[!0-9]*) exit 1;; esac
+            case "$(tr '\000' ' ' < /proc/"$pid"/cmdline 2>/dev/null)" in
+                *start_usb_debug.sh*)
+                    kill "$pid"
+                    # The supervisor handles SIGTERM promptly (sleep & wait).
+                    i=0
+                    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 10 ]; do
+                        i=$((i + 1)); sleep 1
+                    done
+                    ;;
+            esac
+        fi
+        ;;
+    *) echo 'Usage: u2w-usb-debug start|stop' >&2; exit 2;;
+esac

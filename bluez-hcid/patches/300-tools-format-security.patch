@@ -1,0 +1,391 @@
+--- a/tools/hciconfig.c
++++ b/tools/hciconfig.c
+@@ -691,7 +691,7 @@
+ 				if (cls[2] & (1 << s)) {
+ 					if (!first)
+ 						printf(", ");
+-					printf(services[s]);
++					printf("%s", services[s]);
+ 					first = 0;
+ 				}
+ 		} else
+--- a/tools/hcitool.c
++++ b/tools/hcitool.c
+@@ -381,7 +381,7 @@
+ 	for_each_opt(opt, dev_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(dev_help);
++			printf("%s", dev_help);
+ 			return;
+ 		}
+ 	}
+@@ -451,7 +451,7 @@
+ 			break;
+ 
+ 		default:
+-			printf(inq_help);
++			printf("%s", inq_help);
+ 			return;
+ 		}
+ 	}
+@@ -567,7 +567,7 @@
+ 			break;
+ 
+ 		default:
+-			printf(scan_help);
++			printf("%s", scan_help);
+ 			return;
+ 		}
+ 	}
+@@ -774,7 +774,7 @@
+ 	for_each_opt(opt, name_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(name_help);
++			printf("%s", name_help);
+ 			return;
+ 		}
+ 	}
+@@ -782,7 +782,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(name_help);
++		printf("%s", name_help);
+ 		return;
+ 	}
+ 
+@@ -833,7 +833,7 @@
+ 	for_each_opt(opt, info_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(info_help);
++			printf("%s", info_help);
+ 			return;
+ 		}
+ 	}
+@@ -841,7 +841,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(info_help);
++		printf("%s", info_help);
+ 		return;
+ 	}
+ 
+@@ -962,7 +962,7 @@
+ 	for_each_opt(opt, spinq_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(spinq_help);
++			printf("%s", spinq_help);
+ 			return;
+ 		}
+ 	}
+@@ -1015,7 +1015,7 @@
+ 	for_each_opt(opt, epinq_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(epinq_help);
++			printf("%s", epinq_help);
+ 			return;
+ 		}
+ 	}
+@@ -1063,7 +1063,7 @@
+ 	for_each_opt(opt, cmd_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(cmd_help);
++			printf("%s", cmd_help);
+ 			return;
+ 		}
+ 	}
+@@ -1071,7 +1071,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 2) {
+-		printf(cmd_help);
++		printf("%s", cmd_help);
+ 		return;
+ 	}
+ 
+@@ -1082,7 +1082,7 @@
+ 	ogf = strtol(argv[0], NULL, 16);
+ 	ocf = strtol(argv[1], NULL, 16);
+ 	if (errno == ERANGE || (ogf > 0x3f) || (ocf > 0x3ff)) {
+-		printf(cmd_help);
++		printf("%s", cmd_help);
+ 		return;
+ 	}
+ 
+@@ -1146,7 +1146,7 @@
+ 	for_each_opt(opt, con_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(con_help);
++			printf("%s", con_help);
+ 			return;
+ 		}
+ 	}
+@@ -1194,7 +1194,7 @@
+ 			break;
+ 
+ 		default:
+-			printf(cc_help);
++			printf("%s", cc_help);
+ 			return;
+ 		}
+ 	}
+@@ -1202,7 +1202,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(cc_help);
++		printf("%s", cc_help);
+ 		return;
+ 	}
+ 
+@@ -1249,7 +1249,7 @@
+ 	for_each_opt(opt, dc_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(dc_help);
++			printf("%s", dc_help);
+ 			return;
+ 		}
+ 	}
+@@ -1257,7 +1257,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(dc_help);
++		printf("%s", dc_help);
+ 		return;
+ 	}
+ 
+@@ -1319,7 +1319,7 @@
+ 	for_each_opt(opt, sr_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(sr_help);
++			printf("%s", sr_help);
+ 			return;
+ 		}
+ 	}
+@@ -1327,7 +1327,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 2) {
+-		printf(sr_help);
++		printf("%s", sr_help);
+ 		return;
+ 	}
+ 
+@@ -1387,7 +1387,7 @@
+ 	for_each_opt(opt, rssi_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(rssi_help);
++			printf("%s", rssi_help);
+ 			return;
+ 		}
+ 	}
+@@ -1395,7 +1395,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(rssi_help);
++		printf("%s", rssi_help);
+ 		return;
+ 	}
+ 
+@@ -1461,7 +1461,7 @@
+ 	for_each_opt(opt, lq_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(lq_help);
++			printf("%s", lq_help);
+ 			return;
+ 		}
+ 	}
+@@ -1469,7 +1469,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(lq_help);
++		printf("%s", lq_help);
+ 		return;
+ 	}
+ 
+@@ -1536,7 +1536,7 @@
+ 	for_each_opt(opt, tpl_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(tpl_help);
++			printf("%s", tpl_help);
+ 			return;
+ 		}
+ 	}
+@@ -1544,7 +1544,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(tpl_help);
++		printf("%s", tpl_help);
+ 		return;
+ 	}
+ 
+@@ -1613,7 +1613,7 @@
+ 	for_each_opt(opt, afh_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(afh_help);
++			printf("%s", afh_help);
+ 			return;
+ 		}
+ 	}
+@@ -1621,7 +1621,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(afh_help);
++		printf("%s", afh_help);
+ 		return;
+ 	}
+ 
+@@ -1699,7 +1699,7 @@
+ 	for_each_opt(opt, cpt_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(cpt_help);
++			printf("%s", cpt_help);
+ 			return;
+ 		}
+ 	}
+@@ -1707,7 +1707,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 2) {
+-		printf(cpt_help);
++		printf("%s", cpt_help);
+ 		return;
+ 	}
+ 
+@@ -1784,7 +1784,7 @@
+ 	for_each_opt(opt, lp_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(lp_help);
++			printf("%s", lp_help);
+ 			return;
+ 		}
+ 	}
+@@ -1792,7 +1792,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(lp_help);
++		printf("%s", lp_help);
+ 		return;
+ 	}
+ 
+@@ -1883,7 +1883,7 @@
+ 	for_each_opt(opt, lst_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(lst_help);
++			printf("%s", lst_help);
+ 			return;
+ 		}
+ 	}
+@@ -1891,7 +1891,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(lst_help);
++		printf("%s", lst_help);
+ 		return;
+ 	}
+ 
+@@ -1973,7 +1973,7 @@
+ 	for_each_opt(opt, auth_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(auth_help);
++			printf("%s", auth_help);
+ 			return;
+ 		}
+ 	}
+@@ -1981,7 +1981,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(auth_help);
++		printf("%s", auth_help);
+ 		return;
+ 	}
+ 
+@@ -2045,7 +2045,7 @@
+ 	for_each_opt(opt, enc_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(enc_help);
++			printf("%s", enc_help);
+ 			return;
+ 		}
+ 	}
+@@ -2053,7 +2053,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(enc_help);
++		printf("%s", enc_help);
+ 		return;
+ 	}
+ 
+@@ -2118,7 +2118,7 @@
+ 	for_each_opt(opt, key_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(key_help);
++			printf("%s", key_help);
+ 			return;
+ 		}
+ 	}
+@@ -2126,7 +2126,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(key_help);
++		printf("%s", key_help);
+ 		return;
+ 	}
+ 
+@@ -2190,7 +2190,7 @@
+ 	for_each_opt(opt, clkoff_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(clkoff_help);
++			printf("%s", clkoff_help);
+ 			return;
+ 		}
+ 	}
+@@ -2198,7 +2198,7 @@
+ 	argv += optind;
+ 
+ 	if (argc < 1) {
+-		printf(clkoff_help);
++		printf("%s", clkoff_help);
+ 		return;
+ 	}
+ 
+@@ -2266,7 +2266,7 @@
+ 	for_each_opt(opt, clock_options, NULL) {
+ 		switch (opt) {
+ 		default:
+-			printf(clock_help);
++			printf("%s", clock_help);
+ 			return;
+ 		}
+ 	}

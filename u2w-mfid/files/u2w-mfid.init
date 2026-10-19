@@ -1,0 +1,275 @@
+#!/bin/sh
+# U2W mfid supervisor: serves the MFi coprocessor to LIVI over the USB NCM link only
+# (192.168.7.1:5000, see /etc/u2w-mfid.conf). Started once from start_main_service.sh after
+# u2w-usb-debug. "start" returns at once: the supervisor runs in the background, waits for the
+# interface, and restarts mfid with a 2 s -> 60 s backoff when it fails (no chip, bind error),
+# so boot never blocks. It restarts mfid at once when the NCM interface is re-created (new
+# ifindex) or loses its address. Log: /tmp/u2w-mfid.log, kept under 64 KiB (one .1 copy).
+#
+# Singleton without flock (not in this BusyBox): mkdir of /tmp/u2w-mfid.lock is the mutex, the
+# owner's PID is inside. A lock whose PID is dead (or not u2w-mfid) is stale; it is renamed
+# aside atomically before removal so two starters cannot both take it over. mfid itself listens
+# without SO_REUSEPORT, so a second listener fails even if the lock were mishandled.
+PATH=${MFID_PATH:-/bin:/sbin:/usr/bin:/usr/sbin}
+export PATH
+CONF=${MFID_CONF:-/etc/u2w-mfid.conf}
+STATE=${MFID_STATE:-/tmp}
+SYS=${MFID_SYS:-/sys}
+BIN=${MFID_BIN:-/usr/sbin/mfid}
+POLL=${MFID_POLL:-5}
+BACKOFF_MAX=${MFID_BACKOFF_MAX:-60}
+LOCK=$STATE/u2w-mfid.lock
+LOG=$STATE/u2w-mfid.log
+# Rotate before 64 KiB: mfid rate-limits its lines, so one poll period adds far less than this.
+LOG_ROTATE=57344
+
+ENABLED=no
+IFACE=
+BIND=192.168.7.1
+PORT=5000
+BUS=1
+ADDR=0x10
+[ -r "$CONF" ] && . "$CONF"
+
+log() { echo "[u2w-mfid $(date +%H:%M:%S)] $*" >> "$LOG"; }
+
+cmdline() {
+    if [ -r "/proc/$1/cmdline" ]; then
+        tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null
+    else
+        ps -o command= -p "$1" 2>/dev/null # non-Linux test hosts
+    fi
+}
+
+# A live (not zombie) process whose command line contains $2.
+alive() {
+    case "$1" in ''|*[!0-9]*) return 1;; esac
+    kill -0 "$1" 2>/dev/null || return 1
+    if [ -r "/proc/$1/stat" ]; then
+        s=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null)
+        [ "${s%% *}" != Z ] || return 1
+    else
+        case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*|'') return 1;; esac
+    fi
+    case "$(cmdline "$1")" in *"$2"*) return 0;; esac
+    return 1
+}
+
+owner() { cat "$LOCK/pid" 2>/dev/null; }
+
+# Is the lock held by a live u2w-mfid process? If not, $stale is the PID found in it.
+# The PID changes once, from "start" to its supervisor, and "start" writes it before it exits:
+# a PID found dead is read again before the lock is called stale. An empty PID means the owner
+# is between its mkdir and its PID write: it gets two seconds.
+held() {
+    p=$(owner)
+    if [ -z "$p" ] && [ -d "$LOCK" ]; then
+        sleep 1; p=$(owner)
+        [ -n "$p" ] || { sleep 1; p=$(owner); }
+    fi
+    while :; do
+        [ -n "$p" ] && alive "$p" u2w-mfid && return 0
+        q=$(owner)
+        [ -n "$q" ] && [ "$q" != "$p" ] || break
+        p=$q
+    done
+    stale=$p
+    return 1
+}
+
+# Removes the stale lock judged by held(): rename it aside (atomic, one winner), and delete it
+# only if it still holds the PID that was found dead; otherwise it was re-taken: put it back.
+drop_stale() {
+    aside=$LOCK.stale.$$
+    rm -rf "$aside"
+    mv "$LOCK" "$aside" 2>/dev/null || return 0
+    p=$(cat "$aside/pid" 2>/dev/null)
+    if [ "$p" != "$stale" ]; then
+        [ -e "$LOCK" ] || mv "$aside" "$LOCK"
+        rm -rf "$aside"
+        return 1
+    fi
+    c=$(cat "$aside/child" 2>/dev/null)
+    if alive "$c" "$BIN"; then kill "$c" 2>/dev/null; fi
+    rm -rf "$aside"
+    log "removed a stale lock (pid ${p:-none})"
+}
+
+find_iface() {
+    if [ -n "$IFACE" ]; then
+        [ -d "$SYS/class/net/$IFACE" ] && echo "$IFACE"
+        return
+    fi
+    # Same resolution as u2w-usb-debug: the gadget NCM on the device port, never vendor ncm0.
+    for d in "$SYS"/class/net/ncm*; do
+        [ -e "$d" ] || continue
+        case "$(readlink -f "$d/device" 2>/dev/null)" in
+            *ci_hdrc.1*|*dummy_udc*) echo "${d##*/}"; return;;
+        esac
+    done
+    last=
+    for d in "$SYS"/class/net/ncm*; do
+        [ -e "$d" ] || continue
+        [ "${d##*/}" = ncm0 ] || last=${d##*/}
+    done
+    [ -z "$last" ] || echo "$last"
+}
+
+has_addr() {
+    pattern=$(echo "$2" | sed 's/\./\\./g')
+    ifconfig "$1" 2>/dev/null | grep -Eq "inet (addr:)?$pattern([[:space:]]|\$)"
+}
+
+generation() { echo "$1:$(cat "$SYS/class/net/$1/ifindex" 2>/dev/null)"; }
+
+rotate() {
+    [ -f "$LOG" ] || return 0
+    size=$(($(wc -c < "$LOG" 2>/dev/null || echo 0)))
+    [ "$size" -ge "$LOG_ROTATE" ] || return 0
+    # Copy and truncate: every writer appends (O_APPEND), so no descriptor goes stale.
+    cp "$LOG" "$LOG.1" 2>/dev/null
+    : > "$LOG"
+}
+
+nap() { sleep "$1" & sleeper=$!; wait "$sleeper"; sleeper=; }
+
+stop_child() {
+    [ -n "$child" ] || return 0
+    kill "$child" 2>/dev/null
+    i=0
+    while alive "$child" "$BIN" && [ "$i" -lt 10 ]; do i=$((i + 1)); sleep 1; done
+    [ "$i" -lt 10 ] || kill -9 "$child" 2>/dev/null
+    wait "$child" 2>/dev/null
+    child=
+    rm -f "$LOCK/child"
+}
+
+cleanup() {
+    trap - EXIT
+    trap '' INT TERM
+    [ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null
+    stop_child
+    if [ "$(owner)" = "$$" ]; then
+        rm -f "$LOCK/pid" "$LOCK/child"
+        rmdir "$LOCK" 2>/dev/null
+    fi
+    log 'supervisor stopped'
+}
+
+supervise() {
+    # "start" hands the lock over by writing this PID; normally already done.
+    i=0
+    while [ "$(owner)" != "$$" ]; do
+        i=$((i + 1))
+        [ "$i" -le 5 ] || exit 0
+        sleep 1
+    done
+    child= sleeper=
+    trap cleanup EXIT
+    trap 'exit 0' INT TERM
+    trap '' HUP
+    log "supervisor $$ started (bind $BIND:$PORT on ${IFACE:-the USB NCM interface})"
+    backoff=2 waiting=
+    while :; do
+        [ "$(owner)" = "$$" ] || { log 'lock taken over; exiting'; exit 0; }
+        rotate
+        iface=$(find_iface)
+        if [ -z "$iface" ] || ! has_addr "$iface" "$BIND"; then
+            [ -n "$waiting" ] || log "waiting for ${iface:-${IFACE:-the USB NCM interface}} with $BIND"
+            waiting=1
+            nap "$POLL"
+            continue
+        fi
+        waiting=
+        gen=$(generation "$iface")
+        started=$(date +%s)
+        "$BIN" --iface "$iface" --bind "$BIND" --port "$PORT" --bus "$BUS" --addr "$ADDR" \
+            </dev/null >>"$LOG" 2>&1 &
+        child=$!
+        echo "$child" > "$LOCK/child"
+        moved=
+        while alive "$child" "$BIN"; do
+            nap "$POLL"
+            rotate
+            [ "$(owner)" = "$$" ] || { log 'lock taken over; exiting'; exit 0; }
+            if [ "$(find_iface)" != "$iface" ] || [ "$(generation "$iface")" != "$gen" ] ||
+               ! has_addr "$iface" "$BIND"; then
+                moved=1
+                break
+            fi
+        done
+        if [ -n "$moved" ]; then
+            log "$gen changed or lost $BIND; restarting mfid"
+            stop_child
+            backoff=2
+            continue
+        fi
+        wait "$child" 2>/dev/null
+        status=$?
+        child=
+        rm -f "$LOCK/child"
+        if [ "$status" = 3 ]; then
+            # mfid saw the interface or address go away: re-resolve, no backoff.
+            backoff=2
+            nap "$POLL"
+            continue
+        fi
+        [ $(($(date +%s) - started)) -lt 60 ] || backoff=2
+        log "mfid exited with status $status; restarting in $backoff s"
+        nap "$backoff"
+        backoff=$((backoff * 2))
+        [ "$backoff" -le "$BACKOFF_MAX" ] || backoff=$BACKOFF_MAX
+    done
+}
+
+start() {
+    [ "$ENABLED" = yes ] || return 0
+    [ -x "$BIN" ] || { log "$BIN is missing"; return 0; }
+    for _ in 1 2 3; do
+        if mkdir "$LOCK" 2>/dev/null; then
+            echo "$$" > "$LOCK/pid"
+            sh "$0" supervise </dev/null >>"$LOG" 2>&1 &
+            echo "$!" > "$LOCK/pid"
+            return 0
+        fi
+        held && return 0
+        drop_stale || return 0
+    done
+    log 'could not take the lock'
+}
+
+stop() {
+    i=0
+    while [ -d "$LOCK" ] && [ "$i" -lt 15 ]; do
+        if held; then
+            # A "start" that has not handed over yet is left to finish; then stopped.
+            case "$(cmdline "$p")" in *supervise*) kill "$p" 2>/dev/null;; esac
+        else
+            drop_stale
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    if [ -d "$LOCK" ]; then
+        p=$(owner)
+        c=$(cat "$LOCK/child" 2>/dev/null)
+        if alive "$p" supervise; then kill -9 "$p" 2>/dev/null; fi
+        if alive "$c" "$BIN"; then kill -9 "$c" 2>/dev/null; fi
+        sleep 1
+        held || drop_stale
+    fi
+    return 0
+}
+
+case "${1:-}" in
+    start) start;;
+    stop) stop;;
+    restart) stop; start;;
+    supervise) supervise;;
+    status)
+        p=$(owner)
+        if alive "$p" supervise; then echo "running (supervisor $p, mfid $(cat "$LOCK/child" 2>/dev/null))"
+        else echo stopped; exit 1; fi
+        ;;
+    *) echo 'Usage: /etc/init.d/u2w-mfid start|stop|restart|status' >&2; exit 2;;
+esac

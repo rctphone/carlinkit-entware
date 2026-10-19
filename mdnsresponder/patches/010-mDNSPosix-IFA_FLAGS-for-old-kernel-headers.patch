@@ -1,0 +1,19 @@
+mDNSPosix: build against the 3.10 kernel headers of the U2W toolchain.
+
+IFA_FLAGS (enum ifa_attr, value 8) is UAPI since Linux 3.14; mDNSPosix.c only uses it
+to log the attribute, so define it when the headers predate it.
+
+--- a/mDNSPosix/mDNSPosix.c
++++ b/mDNSPosix/mDNSPosix.c
+@@ -45,6 +45,11 @@
+ #include <asm/types.h>
+ #include <linux/netlink.h>
+ #include <linux/rtnetlink.h>
++#include <linux/version.h>
++// IFA_FLAGS (enum ifa_attr) appeared in the 3.14 UAPI; older kernel headers lack it. The value is fixed ABI.
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0) && !defined(IFA_FLAGS)
++#define IFA_FLAGS 8
++#endif
+ #else // USES_NETLINK
+ #include <net/route.h>
+ #include <net/if.h>
