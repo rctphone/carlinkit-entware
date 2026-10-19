@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=u2w-usb-debug
 PKG_VERSION:=1.0.0
 PKG_RELEASE:=8
-PKG_LICENSE:=MIT
+PKG_LICENSE:=GPL-2.0-only
 PKGARCH:=all
 include $(INCLUDE_DIR)/package.mk
 

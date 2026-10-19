@@ -114,8 +114,10 @@ config and DTB delta against a prepared tree; they expect the u2w-build layout (
 
 ## License
 
-Our own code (the `u2w-*` packages, `adbd/src`, build scripts, `audit.py`, `apply-bundle.py`)
-is under the MIT license, see [LICENSE](LICENSE). Each package Makefile states the upstream
+Our own code (the `u2w-*` packages, build scripts, `audit.py`, `apply-bundle.py`) is under the
+GNU General Public License v2.0 only (GPL-2.0-only), see [LICENSE](LICENSE). Exception:
+`adbd/src` is compiled into AOSP adbd and is therefore under adbd's Apache-2.0 license
+(Apache-2.0 and GPL-2.0 cannot be combined in one binary). Each package Makefile states the upstream
 license in `PKG_LICENSE`. Patches to upstream software are under that software's license:
 hostapd (BSD-3-Clause), BlueZ and the Linux kernel patches (GPL-2.0), D-Bus (AFL-2.1 or
 GPL-2.0-or-later), mDNSResponder (Apache-2.0), fdk-aac (Fraunhofer FDK AAC license), adbd

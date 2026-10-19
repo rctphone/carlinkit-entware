@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=u2w-mfid
 PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
-PKG_LICENSE:=MIT
+PKG_LICENSE:=GPL-2.0-only
 # src/ is the canonical source (mfid/build.sh builds the bench tools from it too).
 PKG_FILE_DEPENDS:=$(CURDIR)/src $(CURDIR)/files
 include $(INCLUDE_DIR)/package.mk
