@@ -36,6 +36,8 @@ Each top-level directory is an OpenWrt/Entware package (`Makefile`, plus `files/
 | `u2w-low-latency` | init script: no deep CPU idle, background daemons at nice 19, cdc_ncm TX timer 0 |
 | `u2w-mfid` | `mfid`: the MFi coprocessor (I2C) served over TCP on USB NCM |
 
+`u2w.config` also enables fork packages used alongside this feed, e.g. `strace` 6.18 (debugging; separate package, not in the image).
+
 ## Building
 
 The target is the EE71 Entware fork,
