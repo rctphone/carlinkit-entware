@@ -1,0 +1,8 @@
+packages/
+*.ipk
+*.ko
+*.bin
+*.img
+.DS_Store
+__pycache__/
+*.pyc
