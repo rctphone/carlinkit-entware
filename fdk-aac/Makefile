@@ -5,9 +5,12 @@ include $(TOPDIR)/rules.mk
 # Patches: 010 keeps the 0.1.5+ error-path output clear inside callers that pass timeDataSize
 # in bytes (AppleCarPlay), 020 restores AACENC_BITRATEMODE 8 for ELD (AppleCarPlay's ELD
 # encoder fails to initialise on stock 0.1.5+), 030 backports an LD-SBR bounds check from 2.0.
+# 011 accepts AppleCarPlay's input byte count passed as timeDataSize, for the CarPlay SDK AAC-ELD
+# contract only (AOT 39, frame <= 480 into a >= 480-frame buffer).  Guarded-buffer tests:
+# bash fdk-aac/tests/run.sh (docker).
 PKG_NAME:=fdk-aac
 PKG_VERSION:=0.1.6
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/mstorsjo/fdk-aac/tar.gz/v$(PKG_VERSION)?
 PKG_HASH:=adbcd793e406e1b88b3c1c41382d49f8c27371485b823c0fdab69c9124fd2ce3

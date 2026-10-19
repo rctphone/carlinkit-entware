@@ -1,5 +1,6 @@
 From: U2W build
-Subject: [PATCH] aacdec: keep the output-buffer check; an input byte count passed as size means "unknown"
+Subject: [PATCH] aacdec: an input byte count passed as output size means "unknown", for
+ the CarPlay AAC-ELD contract only
 
 0.1.5 added
   if (timeDataSize_extern < numChannels*frameSize) ErrorStatus = AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
@@ -7,15 +8,29 @@ Subject: [PATCH] aacdec: keep the output-buffer check; an input byte count passe
 firmware 2023-2025), ignored timeDataSize and decoded the frame in place.
 
 Measured in the car (2026-10-19, VW MIB2G, instrumented build): on its AAC-ELD call-audio path
-(AOT 39, 16 kHz, mono, frame 480) AppleCarPlay passes as timeDataSize the input byte count it
-just handed to aacDecoder_Fill (2, 25, 45, 74, 117, 148..181: the packet lengths).  0.1.6
-rejected every frame with 0x200c and calls were silent in the car.  The CarPlay SDK's AAC-ELD
-converter only decodes into a buffer of at least kAudioSamplesPerPacket_AAC_ELD (480) frames.
+(AOT 39, 16 kHz, mono, frameSize 480, aacSamplesPerFrame 480, no SBR) AppleCarPlay passes as
+timeDataSize the input byte count it just handed to aacDecoder_Fill (2, 25, 45, 74, 117,
+148..181: the packet lengths).  0.1.6 rejected every frame with 0x200c and calls were silent.
 
-aacDecoder_Fill records the input byte count per decoder handle.  When timeDataSize equals it,
-the caller passed its input length, not an output size: write the frame as 0.1.4 did
-(numChannels*frameSize samples, the vendor footprint) and log it once per handle.  Every other
-value keeps the 0.1.6 check, so a real undersized buffer is still rejected.
+The vendor allocation contract: the CarPlay SDK's AAC-ELD converter
+(APSAudioConverterStub.c, _AudioConverterFillComplexBufferAACELDDecode) returns kSizeErr unless
+*ioOutputDataPacketSize >= kAudioSamplesPerPacket_AAC_ELD (480), so it only decodes into a
+buffer of at least 480 frames; AudioConverterNew refuses channel mixing, so a frame has the
+stream's channel count, which the AudioSpecificConfig signals (mono or stereo for CarPlay).
+
+aacDecoder_Fill records the input byte count per decoder handle.  The check is skipped, and the
+frame written as 0.1.4 did (numChannels*frameSize samples), only when ALL hold:
+  - timeDataSize == the last aacDecoder_Fill byte count;
+  - streamInfo.aot == AOT_ER_AAC_ELD;
+  - 0 < frameSize <= 480 (so ELD 512, and ELD with dual-rate SBR (960), keep the check);
+  - 0 < numChannels <= channelConfig <= 2 (no upmix beyond the configured channel count).
+The write is then at most 480*numChannels samples: inside the SDK's buffer.  Logged once per
+handle.  Every other stream, frame length or value keeps the 0.1.6 check, so a coincident
+length on AAC-LC or a real undersized buffer is still rejected (patch 010 bounds the clear).
+
+Residual: the decoder cannot see the allocation.  An ELD caller outside that contract that
+passes its fill length as timeDataSize gets a 480-frame write whatever its buffer holds.
+fdk-aac/tests/run.sh checks this with guard-page output buffers.
 
 --- a/libAACdec/src/aacdecoder_lib.cpp
 +++ b/libAACdec/src/aacdecoder_lib.cpp
@@ -28,41 +43,59 @@ value keeps the 0.1.6 check, so a real undersized buffer is still rejected.
  
    aacDec->nrOfLayers = nrOfLayers;
  
-@@ -718,6 +720,9 @@
+@@ -717,6 +719,9 @@
+      available layer                                                           */
    INT layer      = 0;
    INT nrOfLayers = self->nrOfLayers;
- 
++
 +  /* U2W: remember the input byte count; see the output-buffer check in aacDecoder_DecodeFrame. */
 +  self->u2wLastFillBytes = (nrOfLayers > 0) ? (INT)bufferSize[0] : -1;
-+
+ 
    {
      for (layer = 0; layer < nrOfLayers; layer++){
-       {
-@@ -1052,8 +1057,22 @@
+@@ -1052,9 +1057,39 @@
      /* Update Statistics */
      aacDecoder_UpdateBitStreamCounters(&self->streamInfo, hBs, nBits, ErrorStatus);
  
 -    /* Check whether external output buffer is large enough. */
 -    if (timeDataSize_extern < self->streamInfo.numChannels*self->streamInfo.frameSize) {
+-      ErrorStatus = AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
 +    /* Check whether external output buffer is large enough.
 +       U2W: AppleCarPlay's AAC-ELD (call audio) path passes the input byte count it just gave
 +       aacDecoder_Fill as timeDataSize (measured in the car 2026-10-19: 2..181, always the
-+       packet length, frame 1*480).  That is no output size; fdk-aac 0.1.4, the vendor library,
-+       ignored the argument and wrote the frame, and the CarPlay SDK only decodes AAC-ELD into
-+       a buffer of at least kAudioSamplesPerPacket_AAC_ELD frames.  Treat exactly that value as
-+       "size unknown" and write the frame as 0.1.4 did; every other value is checked. */
-+    if (timeDataSize_extern == self->u2wLastFillBytes) {
-+      if (!self->u2wFillSizeLogged) {
-+        self->u2wFillSizeLogged = 1;
-+        FDKprintfErr("fdk-aac: timeDataSize %d is the input byte count, not an output size; "
-+                     "writing one frame (%d samples) as fdk-aac 0.1.4 did\n", timeDataSize_extern,
-+                     self->streamInfo.numChannels*self->streamInfo.frameSize);
++       packet length; AOT 39, 16 kHz, mono, frame 480, no SBR).  That is no output size:
++       fdk-aac 0.1.4, the vendor library, ignored the argument and wrote the frame, and the
++       CarPlay SDK only decodes AAC-ELD into a buffer of at least kAudioSamplesPerPacket_AAC_ELD
++       (480) frames of the stream's channel count.  Only that contract skips the check: the
++       value is the last fill length, the stream is ER AAC-ELD, the decoded frame is at most
++       480 samples per channel and has no more channels than the stream configuration (mono
++       or stereo).  The write is then numChannels*frameSize <= 480*channels samples, inside
++       the SDK's buffer.  Every other stream, frame length or value keeps the check. */
++    {
++      const INT u2wFrameSamples = self->streamInfo.numChannels*self->streamInfo.frameSize;
++      const int u2wEldContract =
++           (timeDataSize_extern == self->u2wLastFillBytes)
++        && (self->streamInfo.aot == AOT_ER_AAC_ELD)
++        && (self->streamInfo.frameSize > 0)
++        && (self->streamInfo.frameSize <= 480)
++        && (self->streamInfo.numChannels > 0)
++        && (self->streamInfo.numChannels <= self->streamInfo.channelConfig)
++        && (self->streamInfo.channelConfig <= 2);
++
++      if (u2wEldContract) {
++        if (!self->u2wFillSizeLogged) {
++          self->u2wFillSizeLogged = 1;
++          FDKprintfErr("fdk-aac: timeDataSize %d is the input byte count, not an output size; "
++                       "writing one AAC-ELD frame (%d samples) as fdk-aac 0.1.4 did\n",
++                       timeDataSize_extern, u2wFrameSamples);
++        }
 +      }
-+    }
-+    else if (timeDataSize_extern < self->streamInfo.numChannels*self->streamInfo.frameSize) {
-       ErrorStatus = AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
++      else if (timeDataSize_extern < u2wFrameSamples) {
++        ErrorStatus = AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
++      }
      }
  
+     /* Update external output buffer. */
 --- a/libAACdec/src/aacdecoder.h
 +++ b/libAACdec/src/aacdecoder.h
 @@ -227,6 +227,8 @@
