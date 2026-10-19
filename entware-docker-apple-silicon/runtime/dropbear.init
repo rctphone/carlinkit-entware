@@ -1,0 +1,47 @@
+#!/bin/sh
+# Key-only root SSH. Host keys live next to the vendor's in /etc/dropbear and are
+# generated on the unit, never shipped. The vendor 2016 DSS/RSA keys there are
+# public and identical on every unit, so only the keys listed below are loaded.
+set -eu
+dir=/etc/dropbear
+types=ed25519
+pid=/var/run/dropbear.pid
+
+running() {
+  [ -s "$pid" ] || return 1
+  p=$(cat "$pid")
+  [ "$(readlink "/proc/$p/exe" 2>/dev/null)" = /usr/sbin/dropbear ]
+}
+
+keys() {
+  umask 077
+  mkdir -p "$dir"
+  for t in $types; do
+    k=$dir/dropbear_${t}_host_key
+    # Missing, empty or unreadable keys are replaced by a fresh one.
+    if ! /usr/bin/dropbearkey -y -f "$k" > /dev/null 2>&1; then
+      rm -f "$k" "$k.pub"
+      /usr/bin/dropbearkey -t "$t" -f "$k" > /dev/null 2>&1
+    fi
+    printf ' -r %s' "$k"
+  done
+}
+
+case "${1:-}" in
+  start)
+    if running; then exit 0; fi
+    test -s /root/.ssh/authorized_keys || {
+      echo 'dropbear: no /root/.ssh/authorized_keys, not starting' >&2; exit 1;
+    }
+    args=$(keys)
+    mkdir -p /var/run
+    # shellcheck disable=SC2086
+    /usr/sbin/dropbear -s -D /root/.ssh -p 22 -P "$pid" $args
+    ;;
+  stop)
+    if running; then kill "$(cat "$pid")"; fi
+    rm -f "$pid"
+    ;;
+  restart) "$0" stop; "$0" start;;
+  *) echo 'Usage: /etc/init.d/dropbear start|stop|restart' >&2; exit 2;;
+esac

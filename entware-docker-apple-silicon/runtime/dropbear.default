@@ -1,0 +1,2 @@
+# /etc/init.d/dropbear uses fixed key-only auth on port 22.
+# No install-time service start, password login, or bundled host keys.
