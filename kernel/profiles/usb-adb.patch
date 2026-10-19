@@ -1,0 +1,219 @@
+--- a/drivers/usb/gadget/legacy/iphone.c
++++ b/drivers/usb/gadget/legacy/iphone.c
+@@ -583,6 +583,41 @@
+ static unsigned int autoresume_step_ms;
+ static struct usb_function_instance *func_inst_ss,*func_inst_lb;
+ static struct usb_function *func_ss,*func_ss2,*func_lb,*func_lb2;
++static struct usb_function_instance *func_inst_ncm;
++static struct usb_function *func_ncm;
++static struct usb_function_instance *func_inst_acm;
++static struct usb_function *func_acm;
++static bool ncm_coexist = true;
++module_param(ncm_coexist, bool, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(ncm_coexist, "Add CDC-NCM to configuration 1 and CDC-ACM to configuration 4");
++static int add_ncm(struct usb_configuration *c)
++{
++	struct usb_function_instance *fi; struct usb_function *f; int ret;
++	if (!ncm_coexist || func_ncm) return 0;
++	fi=usb_get_function_instance("ncm");
++	if (IS_ERR(fi)) { dev_err(&c->cdev->gadget->dev,"ncm: instance unavailable: %ld\n",PTR_ERR(fi)); return 0; }
++	f=usb_get_function(fi);
++	if (IS_ERR(f)) { usb_put_function_instance(fi); return 0; }
++	ret=usb_add_function(c,f);
++	if (ret) { usb_put_function(f); usb_put_function_instance(fi); return ret; }
++	func_inst_ncm=fi; func_ncm=f;
++	dev_info(&c->cdev->gadget->dev,"ncm: coexistence enabled in configuration %d\n",c->bConfigurationValue);
++	return 0;
++}
++static int add_acm(struct usb_configuration *c)
++{
++	struct usb_function_instance *fi; struct usb_function *f; int ret;
++	if (!ncm_coexist || func_acm) return 0;
++	fi=usb_get_function_instance("acm");
++	if (IS_ERR(fi)) { dev_err(&c->cdev->gadget->dev,"acm: instance unavailable: %ld\n",PTR_ERR(fi)); return 0; }
++	f=usb_get_function(fi);
++	if (IS_ERR(f)) { usb_put_function_instance(fi); return 0; }
++	ret=usb_add_function(c,f);
++	if (ret) { usb_put_function(f); usb_put_function_instance(fi); return ret; }
++	func_inst_acm=fi; func_acm=f;
++	dev_info(&c->cdev->gadget->dev,"acm: serial console enabled in configuration %d\n",c->bConfigurationValue);
++	return 0;
++}
+ static void zero_autoresume(struct timer_list *timer)
+ {
+ 	struct usb_composite_dev *d=autoresume_cdev;
+@@ -635,15 +670,20 @@
+ 	ptp_amd_driver.iConfiguration=strings_dev[STR_PTP_AMD].id;
+ 	ptp_amd_aue_driver.iConfiguration=strings_dev[STR_PTP_AMD_AUE].id;
+ 	usb_add_config_only(d,&ptp_driver); ret=usb_add_function(&ptp_driver,func_ss); if (ret) goto err_func_lb2;
++	ret=add_ncm(&ptp_driver); if (ret) goto err_func_lb2;
+ 	usb_ep_autoconfig_reset(d->gadget); ret=usb_add_config(d,&ipod_driver,audio_do_config); if (ret) goto err_func_lb2;
+ 	usb_add_config_only(d,&ptp_amd_driver); usb_ep_autoconfig_reset(d->gadget);
+ 	ret=usb_add_function(&ptp_amd_driver,func_ss2); if (ret) goto err_func_lb2;
+ 	usb_add_config_only(d,&ptp_amd_aue_driver); usb_ep_autoconfig_reset(d->gadget);
+ 	ret=usb_add_function(&ptp_amd_aue_driver,func_lb2); if (ret) goto err_func_lb2;
++	ret=add_acm(&ptp_amd_aue_driver); if (ret) goto err_func_lb2;
+ 	usb_ep_autoconfig_reset(d->gadget); usb_composite_overwrite_options(d,&coverwrite);
+ 	dev_info(&d->gadget->dev,"%s, version: Kevin Shi 2020\n",DRIVER_NAME);
+ 	dev_info(&d->gadget->dev,"%s, serial: %s\n",DRIVER_NAME,serial); return 0;
+-err_func_lb2: if (func_lb2) { usb_put_function(func_lb2); func_lb2=NULL; }
++err_func_lb2:
++	if (!IS_ERR_OR_NULL(func_acm)) { usb_remove_function(&ptp_amd_aue_driver,func_acm); usb_put_function(func_acm); usb_put_function_instance(func_inst_acm); func_acm=NULL; func_inst_acm=NULL; }
++	if (!IS_ERR_OR_NULL(func_ncm)) { usb_remove_function(&ptp_driver,func_ncm); usb_put_function(func_ncm); usb_put_function_instance(func_inst_ncm); func_ncm=NULL; func_inst_ncm=NULL; }
++	if (func_lb2) { usb_put_function(func_lb2); func_lb2=NULL; }
+ err_func_ss2: if (func_ss2) { usb_put_function(func_ss2); func_ss2=NULL; }
+ err_func_ss: if (func_ss) { usb_put_function(func_ss); func_ss=NULL; }
+ err_inst_lb: usb_put_function_instance(func_inst_lb); func_inst_lb=NULL;
+@@ -658,6 +698,12 @@
+ 	if (!IS_ERR_OR_NULL(func_lb)) usb_put_function(func_lb);
+ 	if (!IS_ERR_OR_NULL(func_lb2)) usb_put_function(func_lb2);
+ 	usb_put_function_instance(func_inst_lb);
++	if (!IS_ERR_OR_NULL(func_ncm)) usb_put_function(func_ncm);
++	if (!IS_ERR_OR_NULL(func_inst_ncm)) usb_put_function_instance(func_inst_ncm);
++	func_ncm=NULL; func_inst_ncm=NULL;
++	if (!IS_ERR_OR_NULL(func_acm)) usb_put_function(func_acm);
++	if (!IS_ERR_OR_NULL(func_inst_acm)) usb_put_function_instance(func_inst_acm);
++	func_acm=NULL; func_inst_acm=NULL;
+ 	func_ss=func_ss2=func_lb=func_lb2=NULL; func_inst_ss=func_inst_lb=NULL; return 0;
+ }
+ static struct usb_composite_driver zero_driver = {
+U2W wifi-cfg80211 profile: build the vendor RTL8822BS driver (v5.8.7) in cfg80211 mode.
+- Makefile: CONFIG_IOCTL_CFG80211 + RTW_USE_CFG80211_STA_EVENT, CONFIG_80211W=y (PMF/BIP).
+  The private RTL_IOCTL_HOSTAPD WEXT AP path (CONFIG_AP_MODE) is unchanged, so the vendor
+  hostapd keeps working with the same 88x2bs.ko.
+- ioctl_cfg80211.c: cfg80211 API updates for Linux 6.18, version-guarded:
+  6.7 change_beacon(cfg80211_ap_update), 6.9 ch_switch notify without punct_bitmap,
+  6.13 set_monitor_channel(ndev), 6.14 get_tx_power(link_id), 6.17 radio_idx.
+
+--- a/drivers/net/wireless/rtl8822bs/Makefile
++++ b/drivers/net/wireless/rtl8822bs/Makefile
+@@ -73,7 +73,7 @@
+ CONFIG_RTW_ADAPTIVITY_EN = disable
+ CONFIG_RTW_ADAPTIVITY_MODE = normal
+ CONFIG_SIGNAL_SCALE_MAPPING = n
+-CONFIG_80211W = n
++CONFIG_80211W = y
+ CONFIG_REDUCE_TX_CPU_LOADING = n
+ CONFIG_BR_EXT = n
+ CONFIG_TDLS = n
+@@ -2243,6 +2243,10 @@
+ 
+ ifeq ($(CONFIG_PLATFORM_IMX6ULL), y)
+ EXTRA_CFLAGS += -DCONFIG_LITTLE_ENDIAN
++# U2W wifi-cfg80211: nl80211/cfg80211 AP for hostapd 2.x (SAE, PMF). The private
++# RTL_IOCTL_HOSTAPD WEXT interface (CONFIG_AP_MODE) stays, so the vendor hostapd still works.
++EXTRA_CFLAGS += -DCONFIG_IOCTL_CFG80211
++EXTRA_CFLAGS += -DRTW_USE_CFG80211_STA_EVENT
+ endif
+ 
+ ifeq ($(CONFIG_PLATFORM_ZTE_ZX296716), y)
+--- a/drivers/net/wireless/rtl8822bs/os_dep/linux/ioctl_cfg80211.c
++++ b/drivers/net/wireless/rtl8822bs/os_dep/linux/ioctl_cfg80211.c
+@@ -431,7 +431,7 @@
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
+ 	struct cfg80211_chan_def chdef = {};
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
++#if ((LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)) && (LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0))
+ 	u16 punct_bitmap = 0; /*TBD*/
+ #endif
+ 
+@@ -441,7 +441,9 @@
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0))
+ 	if (started) {
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0))
++		cfg80211_ch_switch_started_notify(adapter->pnetdev, &chdef, 0, 0, false);
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
+ 		cfg80211_ch_switch_started_notify(adapter->pnetdev, &chdef, 0, 0, false, punct_bitmap);
+ #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+ 		cfg80211_ch_switch_started_notify(adapter->pnetdev, &chdef, 0, 0, false);
+@@ -466,7 +468,9 @@
+ 	if (!rtw_cfg80211_allow_ch_switch_notify(adapter))
+ 		goto exit;
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0))
++	cfg80211_ch_switch_notify(adapter->pnetdev, &chdef, 0);
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
+ 	cfg80211_ch_switch_notify(adapter->pnetdev, &chdef, 0, punct_bitmap);
+ #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 2))
+ 	cfg80211_ch_switch_notify(adapter->pnetdev, &chdef, 0);
+@@ -3347,7 +3351,11 @@
+ }
+ #endif
+ 
+-static int cfg80211_rtw_set_wiphy_params(struct wiphy *wiphy, u32 changed)
++static int cfg80211_rtw_set_wiphy_params(struct wiphy *wiphy,
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0))
++	int radio_idx,
++#endif
++	u32 changed)
+ {
+ #if 0
+ 	struct iwm_priv *iwm = wiphy_to_iwm(wiphy);
+@@ -4395,6 +4403,9 @@
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
+ 	struct wireless_dev *wdev,
+ #endif
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0))
++	int radio_idx,
++#endif
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)) || defined(COMPAT_KERNEL_RELEASE)
+ 	enum nl80211_tx_power_setting type, int mbm)
+ #else
+@@ -4457,6 +4468,12 @@
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
+ 	struct wireless_dev *wdev,
+ #endif
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0))
++	int radio_idx,
++#endif
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0))
++	unsigned int link_id,
++#endif
+ 	int *dbm)
+ {
+ 	struct dvobj_priv *dvobj = wiphy_to_dvobj(wiphy);
+@@ -5383,8 +5400,14 @@
+ }
+ 
+ static int cfg80211_rtw_change_beacon(struct wiphy *wiphy, struct net_device *ndev,
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0))
++		struct cfg80211_ap_update *update)
++{
++	struct cfg80211_beacon_data *info = &update->beacon;
++#else
+ 		struct cfg80211_beacon_data *info)
+ {
++#endif
+ 	int ret = 0;
+ 	_adapter *adapter = (_adapter *)rtw_netdev_priv(ndev);
+ 
+@@ -6310,6 +6333,9 @@
+ #endif /*#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0))*/
+ 
+ static int cfg80211_rtw_set_monitor_channel(struct wiphy *wiphy
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0))
++	, struct net_device *ndev
++#endif
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
+ 	, struct cfg80211_chan_def *chandef
+ #else
+--- a/drivers/net/wireless/rtl8822bs/core/rtw_ap.c
++++ b/drivers/net/wireless/rtl8822bs/core/rtw_ap.c
+@@ -132,8 +132,11 @@
+ 			if (p !=  NULL)
+ 				offset += tmp_len + 2;
+
+-			/*DS Parameter Set IE, len=3*/
+-			offset += 3;
++			/* DS Parameter Set IE: hostapd >= 2.10 omits it on 5 GHz; a blind +3
++			 * would insert the TIM inside the RSN IE that follows the rates. */
++			p = rtw_get_ie(pie + _BEACON_IE_OFFSET_, _DSSET_IE_, &tmp_len, (pnetwork_mlmeext->IELength - _BEACON_IE_OFFSET_));
++			if (p != NULL)
++				offset += tmp_len + 2;
+
+ 			premainder_ie = pie + offset;
+

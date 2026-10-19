@@ -1,0 +1,79 @@
+--- a/drivers/usb/gadget/legacy/iphone.c
++++ b/drivers/usb/gadget/legacy/iphone.c
+@@ -583,6 +583,41 @@
+ static unsigned int autoresume_step_ms;
+ static struct usb_function_instance *func_inst_ss,*func_inst_lb;
+ static struct usb_function *func_ss,*func_ss2,*func_lb,*func_lb2;
++static struct usb_function_instance *func_inst_ncm;
++static struct usb_function *func_ncm;
++static struct usb_function_instance *func_inst_acm;
++static struct usb_function *func_acm;
++static bool ncm_coexist = true;
++module_param(ncm_coexist, bool, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(ncm_coexist, "Add CDC-NCM to configuration 1 and CDC-ACM to configuration 4");
++static int add_ncm(struct usb_configuration *c)
++{
++	struct usb_function_instance *fi; struct usb_function *f; int ret;
++	if (!ncm_coexist || func_ncm) return 0;
++	fi=usb_get_function_instance("ncm");
++	if (IS_ERR(fi)) { dev_err(&c->cdev->gadget->dev,"ncm: instance unavailable: %ld\n",PTR_ERR(fi)); return 0; }
++	f=usb_get_function(fi);
++	if (IS_ERR(f)) { usb_put_function_instance(fi); return 0; }
++	ret=usb_add_function(c,f);
++	if (ret) { usb_put_function(f); usb_put_function_instance(fi); return ret; }
++	func_inst_ncm=fi; func_ncm=f;
++	dev_info(&c->cdev->gadget->dev,"ncm: coexistence enabled in configuration %d\n",c->bConfigurationValue);
++	return 0;
++}
++static int add_acm(struct usb_configuration *c)
++{
++	struct usb_function_instance *fi; struct usb_function *f; int ret;
++	if (!ncm_coexist || func_acm) return 0;
++	fi=usb_get_function_instance("acm");
++	if (IS_ERR(fi)) { dev_err(&c->cdev->gadget->dev,"acm: instance unavailable: %ld\n",PTR_ERR(fi)); return 0; }
++	f=usb_get_function(fi);
++	if (IS_ERR(f)) { usb_put_function_instance(fi); return 0; }
++	ret=usb_add_function(c,f);
++	if (ret) { usb_put_function(f); usb_put_function_instance(fi); return ret; }
++	func_inst_acm=fi; func_acm=f;
++	dev_info(&c->cdev->gadget->dev,"acm: serial console enabled in configuration %d\n",c->bConfigurationValue);
++	return 0;
++}
+ static void zero_autoresume(struct timer_list *timer)
+ {
+ 	struct usb_composite_dev *d=autoresume_cdev;
+@@ -635,15 +670,20 @@
+ 	ptp_amd_driver.iConfiguration=strings_dev[STR_PTP_AMD].id;
+ 	ptp_amd_aue_driver.iConfiguration=strings_dev[STR_PTP_AMD_AUE].id;
+ 	usb_add_config_only(d,&ptp_driver); ret=usb_add_function(&ptp_driver,func_ss); if (ret) goto err_func_lb2;
++	ret=add_ncm(&ptp_driver); if (ret) goto err_func_lb2;
+ 	usb_ep_autoconfig_reset(d->gadget); ret=usb_add_config(d,&ipod_driver,audio_do_config); if (ret) goto err_func_lb2;
+ 	usb_add_config_only(d,&ptp_amd_driver); usb_ep_autoconfig_reset(d->gadget);
+ 	ret=usb_add_function(&ptp_amd_driver,func_ss2); if (ret) goto err_func_lb2;
+ 	usb_add_config_only(d,&ptp_amd_aue_driver); usb_ep_autoconfig_reset(d->gadget);
+ 	ret=usb_add_function(&ptp_amd_aue_driver,func_lb2); if (ret) goto err_func_lb2;
++	ret=add_acm(&ptp_amd_aue_driver); if (ret) goto err_func_lb2;
+ 	usb_ep_autoconfig_reset(d->gadget); usb_composite_overwrite_options(d,&coverwrite);
+ 	dev_info(&d->gadget->dev,"%s, version: Kevin Shi 2020\n",DRIVER_NAME);
+ 	dev_info(&d->gadget->dev,"%s, serial: %s\n",DRIVER_NAME,serial); return 0;
+-err_func_lb2: if (func_lb2) { usb_put_function(func_lb2); func_lb2=NULL; }
++err_func_lb2:
++	if (!IS_ERR_OR_NULL(func_acm)) { usb_remove_function(&ptp_amd_aue_driver,func_acm); usb_put_function(func_acm); usb_put_function_instance(func_inst_acm); func_acm=NULL; func_inst_acm=NULL; }
++	if (!IS_ERR_OR_NULL(func_ncm)) { usb_remove_function(&ptp_driver,func_ncm); usb_put_function(func_ncm); usb_put_function_instance(func_inst_ncm); func_ncm=NULL; func_inst_ncm=NULL; }
++	if (func_lb2) { usb_put_function(func_lb2); func_lb2=NULL; }
+ err_func_ss2: if (func_ss2) { usb_put_function(func_ss2); func_ss2=NULL; }
+ err_func_ss: if (func_ss) { usb_put_function(func_ss); func_ss=NULL; }
+ err_inst_lb: usb_put_function_instance(func_inst_lb); func_inst_lb=NULL;
+@@ -658,6 +698,12 @@
+ 	if (!IS_ERR_OR_NULL(func_lb)) usb_put_function(func_lb);
+ 	if (!IS_ERR_OR_NULL(func_lb2)) usb_put_function(func_lb2);
+ 	usb_put_function_instance(func_inst_lb);
++	if (!IS_ERR_OR_NULL(func_ncm)) usb_put_function(func_ncm);
++	if (!IS_ERR_OR_NULL(func_inst_ncm)) usb_put_function_instance(func_inst_ncm);
++	func_ncm=NULL; func_inst_ncm=NULL;
++	if (!IS_ERR_OR_NULL(func_acm)) usb_put_function(func_acm);
++	if (!IS_ERR_OR_NULL(func_inst_acm)) usb_put_function_instance(func_inst_acm);
++	func_acm=NULL; func_inst_acm=NULL;
+ 	func_ss=func_ss2=func_lb=func_lb2=NULL; func_inst_ss=func_inst_lb=NULL; return 0;
+ }
+ static struct usb_composite_driver zero_driver = {

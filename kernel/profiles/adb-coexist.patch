@@ -1,0 +1,215 @@
+--- a/drivers/usb/gadget/legacy/iphone.c
++++ b/drivers/usb/gadget/legacy/iphone.c
+@@ -14,7 +14,10 @@
+ #include <linux/unaligned.h>
+ 
+ #include "g_zero.h"
++#include "u_fs.h"
+ 
++#define ADB_WAIT_MS 5000
++
+ #define DRIVER_NAME "iPhone"
+ #define IAP2_RECV_SIZE 4096
+ #define IAP2_IOCTL_CLOSE 26881
+@@ -616,8 +619,40 @@
+ 	if (ret) { usb_put_function(f); usb_put_function_instance(fi); return ret; }
+ 	func_inst_acm=fi; func_acm=f;
+ 	dev_info(&c->cdev->gadget->dev,"acm: serial console enabled in configuration %d\n",c->bConfigurationValue);
++	return 0;
++}
++static struct usb_function_instance *func_inst_ffs;
++static struct usb_function *func_ffs[3];
++static bool adb_ffs_ready;
++static bool adb_probed;
++static DEFINE_MUTEX(adb_probe_lock);
++static struct delayed_work adb_probe_work;
++
++static int add_ffs(struct usb_configuration *c, int idx)
++{
++	struct usb_function *f;
++	int ret;
++
++	if (!adb_ffs_ready || !func_inst_ffs || func_ffs[idx])
++		return 0;
++	f = usb_get_function(func_inst_ffs);
++	if (IS_ERR(f)) {
++		dev_err(&c->cdev->gadget->dev, "adb: ffs function unavailable: %ld\n", PTR_ERR(f));
++		return 0;
++	}
++	ret = usb_add_function(c, f);
++	if (ret) {
++		dev_err(&c->cdev->gadget->dev, "adb: cannot add ffs to config %d: %d\n",
++			c->bConfigurationValue, ret);
++		usb_put_function(f);
++		return 0;
++	}
++	func_ffs[idx] = f;
++	dev_info(&c->cdev->gadget->dev, "adb: FunctionFS enabled in configuration %d\n",
++		 c->bConfigurationValue);
+ 	return 0;
+ }
++
+ static void zero_autoresume(struct timer_list *timer)
+ {
+ 	struct usb_composite_dev *d=autoresume_cdev;
+@@ -641,6 +676,7 @@
+ 	device_desc.iManufacturer=strings_dev[STR_MANUFACTURER].id;
+ 	device_desc.iProduct=strings_dev[STR_PRODUCT].id; device_desc.iSerialNumber=strings_dev[STR_SERIAL].id;
+ 	autoresume_cdev=d; timer_setup(&autoresume_timer,zero_autoresume,0);
++	autoresume_step_ms=autoresume*1000;
+ 	func_inst_ss=usb_get_function_instance("PTP"); if (IS_ERR(func_inst_ss)) return PTR_ERR(func_inst_ss);
+ 	func_inst_lb=usb_get_function_instance("PTP");
+ 	if (IS_ERR(func_inst_lb)) { ret=PTR_ERR(func_inst_lb); func_inst_lb=NULL; goto err_inst_ss; }
+@@ -671,12 +707,15 @@
+ 	ptp_amd_aue_driver.iConfiguration=strings_dev[STR_PTP_AMD_AUE].id;
+ 	usb_add_config_only(d,&ptp_driver); ret=usb_add_function(&ptp_driver,func_ss); if (ret) goto err_func_lb2;
+ 	ret=add_ncm(&ptp_driver); if (ret) goto err_func_lb2;
++	add_ffs(&ptp_driver, 0);
+ 	usb_ep_autoconfig_reset(d->gadget); ret=usb_add_config(d,&ipod_driver,audio_do_config); if (ret) goto err_func_lb2;
+ 	usb_add_config_only(d,&ptp_amd_driver); usb_ep_autoconfig_reset(d->gadget);
+ 	ret=usb_add_function(&ptp_amd_driver,func_ss2); if (ret) goto err_func_lb2;
++	add_ffs(&ptp_amd_driver, 1);
+ 	usb_add_config_only(d,&ptp_amd_aue_driver); usb_ep_autoconfig_reset(d->gadget);
+ 	ret=usb_add_function(&ptp_amd_aue_driver,func_lb2); if (ret) goto err_func_lb2;
+ 	ret=add_acm(&ptp_amd_aue_driver); if (ret) goto err_func_lb2;
++	add_ffs(&ptp_amd_aue_driver, 2);
+ 	usb_ep_autoconfig_reset(d->gadget); usb_composite_overwrite_options(d,&coverwrite);
+ 	dev_info(&d->gadget->dev,"%s, version: Kevin Shi 2020\n",DRIVER_NAME);
+ 	dev_info(&d->gadget->dev,"%s, serial: %s\n",DRIVER_NAME,serial); return 0;
+@@ -704,15 +743,134 @@
+ 	if (!IS_ERR_OR_NULL(func_acm)) usb_put_function(func_acm);
+ 	if (!IS_ERR_OR_NULL(func_inst_acm)) usb_put_function_instance(func_inst_acm);
+ 	func_acm=NULL; func_inst_acm=NULL;
++	{
++		int i;
++		for (i = 0; i < ARRAY_SIZE(func_ffs); i++) {
++			if (!IS_ERR_OR_NULL(func_ffs[i])) usb_put_function(func_ffs[i]);
++			func_ffs[i] = NULL;
++		}
++	}
+ 	func_ss=func_ss2=func_lb=func_lb2=NULL; func_inst_ss=func_inst_lb=NULL; return 0;
+ }
+ static struct usb_composite_driver zero_driver = {
+ 	.name="zero",.dev=&device_desc,.strings=dev_strings,.max_speed=USB_SPEED_HIGH,
+ 	.bind=zero_bind,.unbind=zero_unbind,.suspend=zero_suspend,.resume=zero_resume,
+ };
+-static int __init iphone_init(void) { return usb_composite_probe(&zero_driver); }
++static void iphone_adb_probe_work(struct work_struct *work)
++{
++	int ret;
++
++	mutex_lock(&adb_probe_lock);
++	if (adb_probed) {
++		mutex_unlock(&adb_probe_lock);
++		return;
++	}
++	pr_warn("adb: adbd not ready in %u ms; probing without ADB\n", ADB_WAIT_MS);
++	ret = usb_composite_probe(&zero_driver);
++	if (!ret)
++		adb_probed = true;
++	else
++		pr_err("adb_coexist: probe failed: %d\n", ret);
++	mutex_unlock(&adb_probe_lock);
++}
++
++static int iphone_ffs_ready(struct ffs_data *ffs)
++{
++	int ret;
++
++	mutex_lock(&adb_probe_lock);
++	if (adb_probed) {
++		mutex_unlock(&adb_probe_lock);
++		return 0;
++	}
++	adb_ffs_ready = true;
++	ret = usb_composite_probe(&zero_driver);
++	if (ret < 0) {
++		adb_ffs_ready = false;
++		pr_err("adb_coexist: probe failed: %d\n", ret);
++	} else {
++		adb_probed = true;
++	}
++	mutex_unlock(&adb_probe_lock);
++	return ret;
++}
++
++static void iphone_ffs_closed(struct ffs_data *ffs)
++{
++	mutex_lock(&adb_probe_lock);
++	if (adb_probed) {
++		adb_probed = false;
++		adb_ffs_ready = false;
++		usb_composite_unregister(&zero_driver);
++	}
++	mutex_unlock(&adb_probe_lock);
++}
++
++/*
++ * Hold a reference on g_iphone while adbd owns FunctionFS.  The vendor
++ * userspace runs "rmmod g_iphone" when CarPlay times out; without this
++ * reference the unload starts, tears the composite down (killing NCM and
++ * ADB on the same UDC) and then hangs.  With the reference rmmod fails
++ * with EBUSY before anything is unbound.
++ */
++static void *iphone_acquire_dev(struct ffs_dev *dev)
++{
++	if (!try_module_get(THIS_MODULE))
++		return ERR_PTR(-ENOENT);
++	return NULL;
++}
++
++static void iphone_release_dev(struct ffs_dev *dev)
++{
++	module_put(THIS_MODULE);
++}
++
++static int __init iphone_init(void)
++{
++	struct f_fs_opts *opts;
++	int ret;
++
++	INIT_DELAYED_WORK(&adb_probe_work, iphone_adb_probe_work);
++	func_inst_ffs = usb_get_function_instance("ffs");
++	if (IS_ERR(func_inst_ffs)) {
++		pr_err("adb: ffs instance unavailable: %ld\n", PTR_ERR(func_inst_ffs));
++		func_inst_ffs = NULL;
++		ret = usb_composite_probe(&zero_driver);
++		adb_probed = !ret;
++		return ret;
++	}
++	opts = to_f_fs_opts(func_inst_ffs);
++	ret = ffs_name_dev(opts->dev, "adb");
++	if (ret) {
++		pr_err("adb: cannot name ffs device: %d\n", ret);
++		usb_put_function_instance(func_inst_ffs);
++		func_inst_ffs = NULL;
++		ret = usb_composite_probe(&zero_driver);
++		adb_probed = !ret;
++		return ret;
++	}
++	opts->dev->ffs_ready_callback = iphone_ffs_ready;
++	opts->dev->ffs_closed_callback = iphone_ffs_closed;
++	opts->dev->ffs_acquire_dev_callback = iphone_acquire_dev;
++	opts->dev->ffs_release_dev_callback = iphone_release_dev;
++	opts->no_configfs = true;
++	schedule_delayed_work(&adb_probe_work, msecs_to_jiffies(ADB_WAIT_MS));
++	pr_info("adb: waiting up to %u ms for adbd descriptors\n", ADB_WAIT_MS);
++	return 0;
++}
++
+ module_init(iphone_init);
+-static void __exit iphone_cleanup(void) { usb_composite_unregister(&zero_driver); }
++static void __exit iphone_cleanup(void)
++{
++	cancel_delayed_work_sync(&adb_probe_work);
++	if (adb_probed)
++		usb_composite_unregister(&zero_driver);
++	if (func_inst_ffs) {
++		usb_put_function_instance(func_inst_ffs);
++		func_inst_ffs = NULL;
++	}
++}
++
+ module_exit(iphone_cleanup);
+ MODULE_AUTHOR("Reconstructed from Carlinkit vendor module");
+ MODULE_DESCRIPTION("Reconstructed Carlinkit iPhone/iAP2 USB gadget");

@@ -1,0 +1,85 @@
+--- a/drivers/mmc/host/sdhci.h
++++ b/drivers/mmc/host/sdhci.h
+@@ -646,6 +646,7 @@
+ 	unsigned		timing;		/* Current timing */
+ 
+ 	u32			thread_isr;
++	bool			sdio_irq_pm_ref;	/* runtime PM ref held for SDIO IRQs */
+ 
+ 	/* cached registers */
+ 	u32			ier;
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -2611,15 +2611,21 @@
+ 	struct sdhci_host *host = mmc_priv(mmc);
+ 	unsigned long flags;
+ 
+-	if (enable)
+-		pm_runtime_get_noresume(mmc_dev(mmc));
+-
++	/*
++	 * U2W: the SCHED_FIFO sdio_irq_thread re-enables after every interrupt
++	 * and the hard IRQ only masks, so hold one runtime PM reference while
++	 * SDIO IRQs are wanted instead of one per enable call.
++	 */
+ 	spin_lock_irqsave(&host->lock, flags);
++	if (enable && !host->sdio_irq_pm_ref) {
++		pm_runtime_get_noresume(mmc_dev(mmc));
++		host->sdio_irq_pm_ref = true;
++	} else if (!enable && host->sdio_irq_pm_ref) {
++		host->sdio_irq_pm_ref = false;
++		pm_runtime_put_noidle(mmc_dev(mmc));
++	}
+ 	sdhci_enable_sdio_irq_nolock(host, enable);
+ 	spin_unlock_irqrestore(&host->lock, flags);
+-
+-	if (!enable)
+-		pm_runtime_put_noidle(mmc_dev(mmc));
+ }
+ EXPORT_SYMBOL_GPL(sdhci_enable_sdio_irq);
+ 
+@@ -3634,8 +3640,11 @@
+ 
+ 		if ((intmask & SDHCI_INT_CARD_INT) &&
+ 		    (host->ier & SDHCI_INT_CARD_INT)) {
++			/* Mask only; the thread re-enables after handling it. */
+ 			sdhci_enable_sdio_irq_nolock(host, false);
+-			sdio_signal_irq(host->mmc);
++			host->mmc->sdio_irq_pending = true;
++			if (host->mmc->sdio_irq_thread)
++				wake_up_process(host->mmc->sdio_irq_thread);
+ 		}
+ 
+ 		intmask &= ~(SDHCI_INT_CARD_INSERT | SDHCI_INT_CARD_REMOVE |
+@@ -4506,8 +4515,12 @@
+ 	    !host->ops->get_max_timeout_count)
+ 		mmc->max_busy_timeout = 0;
+ 
++	/*
++	 * U2W: SDIO card IRQs (RTL8822BS Wi-Fi RX) run in the core's SCHED_FIFO
++	 * sdio_irq_thread, as on the vendor 3.14 kernel, not in a normal-priority
++	 * system_wq worker that competes with the CarPlay daemons for the CPU.
++	 */
+ 	mmc->caps |= MMC_CAP_SDIO_IRQ | MMC_CAP_CMD23;
+-	mmc->caps2 |= MMC_CAP2_SDIO_IRQ_NOTHREAD;
+ 
+ 	if (host->quirks & SDHCI_QUIRK_MULTIBLOCK_READ_ACMD12)
+ 		host->flags |= SDHCI_AUTO_CMD12;
+--- a/drivers/net/wireless/rtl8822bs/Makefile
++++ b/drivers/net/wireless/rtl8822bs/Makefile
+@@ -1,5 +1,5 @@
+ EXTRA_CFLAGS += $(USER_EXTRA_CFLAGS)
+-EXTRA_CFLAGS += -Os
++EXTRA_CFLAGS += -O2
+ #EXTRA_CFLAGS += -O3
+ #EXTRA_CFLAGS += -Wall
+ #EXTRA_CFLAGS += -Wextra
+@@ -94,7 +94,7 @@
+ CONFIG_RTW_VHT_2G4 = y
+ 
+ ########################## Debug ###########################
+-CONFIG_RTW_DEBUG = y
++CONFIG_RTW_DEBUG = n
+ # default log level is _DRV_INFO_ = 4,
+ # please refer to "How_to_set_driver_debug_log_level.doc" to set the available level.
+ CONFIG_RTW_LOG_LEVEL = 2

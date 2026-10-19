@@ -1,0 +1,173 @@
+U2W iap2-wait: /dev/ipod_iap2 without busy polling.
+
+- open() waits up to 200 ms for the host to select the iPod HID alt setting before the same
+  -ENODEV: fakeiOSDevice retries open() in a ~10 ms loop for 300 s when no car is attached
+  (bench, charger), which cost ~28% CPU (strace 2026-10-19: 47 Hz, each re-parsing
+  /tmp/.riddle.conf); now ~5 Hz.
+- read() and write() sleep on a wait queue instead of msleep(5) polls (up to 5 ms extra
+  latency per iAP2 message and constant wakeups).
+- iap2_lock becomes a spinlock: f_hid_set_report_complete() runs in the UDC hard-IRQ
+  completion and must not take a mutex; read() copies out through a bounce buffer.
+
+--- a/drivers/usb/gadget/legacy/iphone.c
++++ b/drivers/usb/gadget/legacy/iphone.c
+@@ -12,6 +12,7 @@
+ #include <linux/usb/composite.h>
+ #include <linux/workqueue.h>
+ #include <linux/unaligned.h>
++#include <linux/wait.h>
+ 
+ #include "u_ether.h"
+ #include "u_ncm.h"
+@@ -235,8 +236,17 @@
+ };
+ static const u8 iap2_detect_packet[] = { 0xff,0x55,0x02,0x00,0xee,0x10 };
+ 
+-static DEFINE_MUTEX(iap2_lock);
++/*
++ * U2W iap2-wait: iap2_lock is a spinlock because f_hid_set_report_complete() runs in the UDC's
++ * hard-IRQ completion; readers copy out through iap2_read_buf.  iap2_wq replaces the 5 ms
++ * msleep() polls: it is woken when the host selects the iPod HID alt setting, on received
++ * data, on send completion, and on close/unbind.
++ */
++static DEFINE_SPINLOCK(iap2_lock);
++static DEFINE_MUTEX(iap2_read_lock);
++static DECLARE_WAIT_QUEUE_HEAD(iap2_wq);
+ static u8 iap2_recv_buf[IAP2_RECV_SIZE];
++static u8 iap2_read_buf[IAP2_RECV_SIZE];
+ static unsigned int iap2_recv_buf_size;
+ static struct f_iphone *iap2_audio;
+ static bool iap2_closed, iap2_send_finish;
+@@ -271,7 +281,8 @@
+ }
+ static void f_hid_complete(struct usb_ep *ep, struct usb_request *req)
+ {
+-	iap2_send_finish = true;
++	WRITE_ONCE(iap2_send_finish, true);
++	wake_up(&iap2_wq);
+ 	if (iap2_audio)
+ 		dev_err(&iap2_audio->cdev->gadget->dev,
+ 			"ep %s hid req actual len: %u\n", ep->name, req->actual);
+@@ -281,6 +292,7 @@
+ 	struct f_iphone *a = req->context;
+ 	u8 *data = req->buf;
+ 	unsigned int len = req->actual;
++	unsigned long flags;
+ 	if (!a || !len)
+ 		return;
+ 	dev_err(&a->cdev->gadget->dev,
+@@ -293,16 +305,17 @@
+ 		return;
+ 	}
+ 	put_unaligned_le16(len, data);
+-	mutex_lock(&iap2_lock);
++	spin_lock_irqsave(&iap2_lock, flags);
+ 	if (iap2_recv_buf_size + len > sizeof(iap2_recv_buf))
+ 		dev_err(&a->cdev->gadget->dev,
+ 			"f_hid_recv_iap2_data buffer not enough:%u--%u\n",
+ 			iap2_recv_buf_size,len);
+ 	else {
+ 		memcpy(iap2_recv_buf + iap2_recv_buf_size, data, len);
+-		iap2_recv_buf_size += len;
++		WRITE_ONCE(iap2_recv_buf_size, iap2_recv_buf_size + len);
+ 	}
+-	mutex_unlock(&iap2_lock);
++	spin_unlock_irqrestore(&iap2_lock, flags);
++	wake_up(&iap2_wq);
+ }
+ static void f_audio_complete(struct usb_ep *ep, struct usb_request *req)
+ {
+@@ -412,7 +425,8 @@
+ 	ret = config_ep_by_speed(a->cdev->gadget,f,a->hid_in_ep);
+ 	if (ret) dev_err(&a->cdev->gadget->dev,"config_ep_by_speed FAILED!\n");
+ 	else { ret = usb_ep_enable(a->hid_in_ep); if (!ret) a->hid_in_ep->driver_data = a; }
+-	iap2_audio = a;
++	WRITE_ONCE(iap2_audio, a);
++	wake_up(&iap2_wq);
+ 	dev_err(&a->cdev->gadget->dev,"Set iPod Hid Interface Alt\n");
+ 	return ret;
+ }
+@@ -475,7 +489,8 @@
+ static void f_audio_unbind(struct usb_configuration *c, struct usb_function *f)
+ {
+ 	struct f_iphone *a=func_to_iphone(f);
+-	iap2_audio=NULL; iap2_closed=true; misc_deregister(&iap2_device);
++	WRITE_ONCE(iap2_audio, NULL); WRITE_ONCE(iap2_closed, true); wake_up(&iap2_wq);
++	misc_deregister(&iap2_device);
+ 	cancel_work_sync(&a->playback_work);
+ 	if (a->audio_out_ep) usb_ep_disable(a->audio_out_ep);
+ 	if (a->hid_in_ep) {
+@@ -487,22 +502,35 @@
+ 
+ static int iap2_open(struct inode *inode, struct file *file)
+ {
+-	if (!iap2_audio) return -ENODEV;
+-	iap2_closed=false; pr_info("ipod_iap2_open\n"); return 0;
++	/* No host has selected the iPod configuration yet.  fakeiOSDevice retries open() in a
++	 * ~10 ms loop for 300 s; waiting here (woken by set_alt) keeps that loop near 5 Hz. */
++	if (!READ_ONCE(iap2_audio))
++		wait_event_interruptible_timeout(iap2_wq, READ_ONCE(iap2_audio), msecs_to_jiffies(200));
++	if (!READ_ONCE(iap2_audio)) return -ENODEV;
++	WRITE_ONCE(iap2_closed, false); pr_info("ipod_iap2_open\n"); return 0;
+ }
+ static ssize_t iap2_read(struct file *file,char __user *buf,size_t count,loff_t *ppos)
+ {
+-	unsigned int plen,n;
+-	for (;;) { if (!iap2_audio || iap2_closed) return -ENODEV; if (READ_ONCE(iap2_recv_buf_size)) break; msleep(5); }
+-	mutex_lock(&iap2_lock);
+-	if (iap2_recv_buf_size<2) { mutex_unlock(&iap2_lock); return -EIO; }
++	unsigned int plen,n; unsigned long flags; ssize_t ret;
++	ret = wait_event_interruptible(iap2_wq, !READ_ONCE(iap2_audio) || READ_ONCE(iap2_closed) ||
++				       READ_ONCE(iap2_recv_buf_size));
++	if (ret) return ret;
++	if (!READ_ONCE(iap2_audio) || READ_ONCE(iap2_closed)) return -ENODEV;
++	mutex_lock(&iap2_read_lock);
++	spin_lock_irqsave(&iap2_lock, flags);
++	if (iap2_recv_buf_size<2) { ret=-EIO; goto unlock; }
+ 	plen=get_unaligned_le16(iap2_recv_buf);
+-	if (plen<2 || plen>iap2_recv_buf_size) { mutex_unlock(&iap2_lock); return -EIO; }
++	if (plen<2 || plen>iap2_recv_buf_size) { ret=-EIO; goto unlock; }
+ 	n=min_t(unsigned int,count,plen-2);
+-	if (copy_to_user(buf,iap2_recv_buf+2,n)) { mutex_unlock(&iap2_lock); return -EFAULT; }
++	memcpy(iap2_read_buf,iap2_recv_buf+2,n);
+ 	iap2_recv_buf_size-=plen;
+ 	if (iap2_recv_buf_size) memmove(iap2_recv_buf,iap2_recv_buf+plen,iap2_recv_buf_size);
+-	mutex_unlock(&iap2_lock); return n;
++	ret=n;
++unlock:
++	spin_unlock_irqrestore(&iap2_lock, flags);
++	if (ret > 0 && copy_to_user(buf,iap2_read_buf,ret)) ret=-EFAULT;
++	mutex_unlock(&iap2_read_lock);
++	return ret;
+ }
+ static ssize_t iap2_write(struct file *file,const char __user *buf,size_t count,loff_t *ppos)
+ {
+@@ -513,20 +541,24 @@
+ 	req->status=0; req->zero=0; req->length=hid_report_size_table[report]+1;
+ 	req->context=a; req->complete=f_hid_complete; memset(req->buf,0,req->length);
+ 	if (copy_from_user((u8 *)req->buf+2,buf,count)) return -EFAULT;
+-	((u8 *)req->buf)[0]=report+1; iap2_send_finish=false;
++	((u8 *)req->buf)[0]=report+1; WRITE_ONCE(iap2_send_finish, false);
+ 	ret=usb_ep_queue(a->hid_in_ep,req,GFP_ATOMIC);
+ 	if (ret) { dev_err(&a->cdev->gadget->dev,"%s queue req: %d\n",a->hid_in_ep->name,ret); return ret; }
+-	while (iap2_audio && !iap2_closed && !iap2_send_finish) msleep(5);
++	/* Uninterruptible like the old msleep() loop: req is reused, so never leave it in flight. */
++	wait_event(iap2_wq, !READ_ONCE(iap2_audio) || READ_ONCE(iap2_closed) || READ_ONCE(iap2_send_finish));
+ 	return count;
+ }
+ static long iap2_ioctl(struct file *file,unsigned int cmd,unsigned long arg)
+ {
+-	pr_info("ipod_iap2_ioctl %u\n",cmd); if (cmd!=IAP2_IOCTL_CLOSE) return -EINVAL; iap2_closed=true; return 0;
++	pr_info("ipod_iap2_ioctl %u\n",cmd); if (cmd!=IAP2_IOCTL_CLOSE) return -EINVAL;
++	WRITE_ONCE(iap2_closed, true); wake_up(&iap2_wq); return 0;
+ }
+ static int iap2_flush(struct file *file,fl_owner_t id) { pr_info("ipod_iap2_flush\n"); return 0; }
+ static int iap2_release(struct inode *inode,struct file *file)
+ {
+-	pr_info("ipod_iap2_release\n"); mutex_lock(&iap2_lock); iap2_recv_buf_size=0; mutex_unlock(&iap2_lock); return 0;
++	unsigned long flags;
++	pr_info("ipod_iap2_release\n"); spin_lock_irqsave(&iap2_lock, flags); iap2_recv_buf_size=0;
++	spin_unlock_irqrestore(&iap2_lock, flags); return 0;
+ }
+ static const struct file_operations iap2_fops = {
+ 	.owner=THIS_MODULE,.open=iap2_open,.read=iap2_read,.write=iap2_write,

@@ -1,0 +1,140 @@
+U2W wifi-cfg80211 profile: build the vendor RTL8822BS driver (v5.8.7) in cfg80211 mode.
+- Makefile: CONFIG_IOCTL_CFG80211 + RTW_USE_CFG80211_STA_EVENT, CONFIG_80211W=y (PMF/BIP).
+  The private RTL_IOCTL_HOSTAPD WEXT AP path (CONFIG_AP_MODE) is unchanged, so the vendor
+  hostapd keeps working with the same 88x2bs.ko.
+- ioctl_cfg80211.c: cfg80211 API updates for Linux 6.18, version-guarded:
+  6.7 change_beacon(cfg80211_ap_update), 6.9 ch_switch notify without punct_bitmap,
+  6.13 set_monitor_channel(ndev), 6.14 get_tx_power(link_id), 6.17 radio_idx.
+
+--- a/drivers/net/wireless/rtl8822bs/Makefile
++++ b/drivers/net/wireless/rtl8822bs/Makefile
+@@ -73,7 +73,7 @@
+ CONFIG_RTW_ADAPTIVITY_EN = disable
+ CONFIG_RTW_ADAPTIVITY_MODE = normal
+ CONFIG_SIGNAL_SCALE_MAPPING = n
+-CONFIG_80211W = n
++CONFIG_80211W = y
+ CONFIG_REDUCE_TX_CPU_LOADING = n
+ CONFIG_BR_EXT = n
+ CONFIG_TDLS = n
+@@ -2243,6 +2243,10 @@
+ 
+ ifeq ($(CONFIG_PLATFORM_IMX6ULL), y)
+ EXTRA_CFLAGS += -DCONFIG_LITTLE_ENDIAN
++# U2W wifi-cfg80211: nl80211/cfg80211 AP for hostapd 2.x (SAE, PMF). The private
++# RTL_IOCTL_HOSTAPD WEXT interface (CONFIG_AP_MODE) stays, so the vendor hostapd still works.
++EXTRA_CFLAGS += -DCONFIG_IOCTL_CFG80211
++EXTRA_CFLAGS += -DRTW_USE_CFG80211_STA_EVENT
+ endif
+ 
+ ifeq ($(CONFIG_PLATFORM_ZTE_ZX296716), y)
+--- a/drivers/net/wireless/rtl8822bs/os_dep/linux/ioctl_cfg80211.c
++++ b/drivers/net/wireless/rtl8822bs/os_dep/linux/ioctl_cfg80211.c
+@@ -431,7 +431,7 @@
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
+ 	struct cfg80211_chan_def chdef = {};
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
++#if ((LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)) && (LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0))
+ 	u16 punct_bitmap = 0; /*TBD*/
+ #endif
+ 
+@@ -441,7 +441,9 @@
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0))
+ 	if (started) {
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0))
++		cfg80211_ch_switch_started_notify(adapter->pnetdev, &chdef, 0, 0, false);
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
+ 		cfg80211_ch_switch_started_notify(adapter->pnetdev, &chdef, 0, 0, false, punct_bitmap);
+ #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+ 		cfg80211_ch_switch_started_notify(adapter->pnetdev, &chdef, 0, 0, false);
+@@ -466,7 +468,9 @@
+ 	if (!rtw_cfg80211_allow_ch_switch_notify(adapter))
+ 		goto exit;
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0))
++	cfg80211_ch_switch_notify(adapter->pnetdev, &chdef, 0);
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)) || defined(CONFIG_MLD_KERNEL_PATCH)
+ 	cfg80211_ch_switch_notify(adapter->pnetdev, &chdef, 0, punct_bitmap);
+ #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 2))
+ 	cfg80211_ch_switch_notify(adapter->pnetdev, &chdef, 0);
+@@ -3347,7 +3351,11 @@
+ }
+ #endif
+ 
+-static int cfg80211_rtw_set_wiphy_params(struct wiphy *wiphy, u32 changed)
++static int cfg80211_rtw_set_wiphy_params(struct wiphy *wiphy,
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0))
++	int radio_idx,
++#endif
++	u32 changed)
+ {
+ #if 0
+ 	struct iwm_priv *iwm = wiphy_to_iwm(wiphy);
+@@ -4395,6 +4403,9 @@
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
+ 	struct wireless_dev *wdev,
+ #endif
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0))
++	int radio_idx,
++#endif
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)) || defined(COMPAT_KERNEL_RELEASE)
+ 	enum nl80211_tx_power_setting type, int mbm)
+ #else
+@@ -4457,6 +4468,12 @@
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
+ 	struct wireless_dev *wdev,
+ #endif
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0))
++	int radio_idx,
++#endif
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0))
++	unsigned int link_id,
++#endif
+ 	int *dbm)
+ {
+ 	struct dvobj_priv *dvobj = wiphy_to_dvobj(wiphy);
+@@ -5383,8 +5400,14 @@
+ }
+ 
+ static int cfg80211_rtw_change_beacon(struct wiphy *wiphy, struct net_device *ndev,
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0))
++		struct cfg80211_ap_update *update)
++{
++	struct cfg80211_beacon_data *info = &update->beacon;
++#else
+ 		struct cfg80211_beacon_data *info)
+ {
++#endif
+ 	int ret = 0;
+ 	_adapter *adapter = (_adapter *)rtw_netdev_priv(ndev);
+ 
+@@ -6310,6 +6333,9 @@
+ #endif /*#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0))*/
+ 
+ static int cfg80211_rtw_set_monitor_channel(struct wiphy *wiphy
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0))
++	, struct net_device *ndev
++#endif
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
+ 	, struct cfg80211_chan_def *chandef
+ #else
+--- a/drivers/net/wireless/rtl8822bs/core/rtw_ap.c
++++ b/drivers/net/wireless/rtl8822bs/core/rtw_ap.c
+@@ -132,8 +132,11 @@
+ 			if (p !=  NULL)
+ 				offset += tmp_len + 2;
+
+-			/*DS Parameter Set IE, len=3*/
+-			offset += 3;
++			/* DS Parameter Set IE: hostapd >= 2.10 omits it on 5 GHz; a blind +3
++			 * would insert the TIM inside the RSN IE that follows the rates. */
++			p = rtw_get_ie(pie + _BEACON_IE_OFFSET_, _DSSET_IE_, &tmp_len, (pnetwork_mlmeext->IELength - _BEACON_IE_OFFSET_));
++			if (p != NULL)
++				offset += tmp_len + 2;
+
+ 			premainder_ie = pie + offset;
+

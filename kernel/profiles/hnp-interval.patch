@@ -1,0 +1,33 @@
+--- a/drivers/usb/gadget/legacy/iphone.c
++++ b/drivers/usb/gadget/legacy/iphone.c
+@@ -548,6 +548,11 @@
+ 	if (ret) kfree(a); else dev_info(&c->cdev->gadget->dev,"audio_buf_size %d, req_buf_size %d, req_count %d\n",audio_buf_size,req_buf_size,req_count);
+ 	return 0;
+ }
++
++/* Stock 3.14 g_iphone parameter (start_iphone.sh passes riddleBoxCfg HNPInterval). */
++static unsigned int hnp_interval_ms = 10;
++module_param(hnp_interval_ms, uint, S_IRUGO);
++MODULE_PARM_DESC(hnp_interval_ms, "milliseconds to do USB role switch delays");
+ 
+ static struct delayed_work start_work;
+ static void iph_start_work(struct work_struct *work)
+@@ -564,7 +569,7 @@
+ 	u16 val=le16_to_cpu(ctrl->wValue),idx=le16_to_cpu(ctrl->wIndex),lenv=le16_to_cpu(ctrl->wLength); int len;
+ 	dev_err(&d->gadget->dev,"iph_ctrlrequest %02x.%02x v%04x i%04x l%u\n",ctrl->bRequestType,ctrl->bRequest,val,idx,lenv);
+ 	if (ctrl->bRequestType==0x40 && ctrl->bRequest==0x51) {
+-		if (val<=1) queue_delayed_work(system_wq,&start_work,msecs_to_jiffies(50)); len=0;
++		if (val<=1) queue_delayed_work(system_wq,&start_work,msecs_to_jiffies(hnp_interval_ms)); len=0;
+ 	} else if (ctrl->bRequestType==0xc0 && ctrl->bRequest==0x53) {
+ 		((u8 *)req->buf)[0]=1; ((u8 *)req->buf)[1]=0; len=4;
+ 	} else {
+@@ -717,7 +722,8 @@
+ 	add_ffs(&ptp_amd_aue_driver, 2);
+ 	usb_ep_autoconfig_reset(d->gadget); usb_composite_overwrite_options(d,&coverwrite);
+ 	dev_info(&d->gadget->dev,"%s, version: Kevin Shi 2020\n",DRIVER_NAME);
+-	dev_info(&d->gadget->dev,"%s, serial: %s\n",DRIVER_NAME,serial); return 0;
++	dev_info(&d->gadget->dev,"%s, serial: %s\n",DRIVER_NAME,serial);
++	dev_info(&d->gadget->dev,"%s, hnp_interval_ms: %u\n",DRIVER_NAME,hnp_interval_ms); return 0;
+ err_func_lb2:
+ 	if (!IS_ERR_OR_NULL(func_acm)) { usb_remove_function(&ptp_amd_aue_driver,func_acm); usb_put_function(func_acm); usb_put_function_instance(func_inst_acm); func_acm=NULL; func_inst_acm=NULL; }
+ 	if (!IS_ERR_OR_NULL(func_ncm)) { usb_remove_function(&ptp_driver,func_ncm); usb_put_function(func_ncm); usb_put_function_instance(func_inst_ncm); func_ncm=NULL; func_inst_ncm=NULL; }

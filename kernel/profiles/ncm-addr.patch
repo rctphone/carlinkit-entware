@@ -1,0 +1,37 @@
+U2W ncm-addr: dev_addr/host_addr module parameters (the g_ether/g_ncm names) for the g_iphone
+CDC-NCM function, so the Mac sees the same USB Ethernet adapter on every load instead of a new
+random one.  start_iphone.sh derives both from the per-unit Wi-Fi MAC (install-firmware-profile.py).
+
+--- a/drivers/usb/gadget/legacy/iphone.c
++++ b/drivers/usb/gadget/legacy/iphone.c
+@@ -15,2 +15,4 @@
+
++#include "u_ether.h"
++#include "u_ncm.h"
+ #include "g_zero.h"
+@@ -598,12 +600,25 @@
+ static bool ncm_coexist = true;
+ module_param(ncm_coexist, bool, S_IRUGO | S_IWUSR);
+ MODULE_PARM_DESC(ncm_coexist, "Add CDC-NCM to configuration 1 and CDC-ACM to configuration 4");
++/* U2W: fixed NCM addresses (g_ether/g_ncm names); unset or invalid keeps u_ether's random ones. */
++static char *dev_addr;
++module_param(dev_addr, charp, S_IRUGO);
++MODULE_PARM_DESC(dev_addr, "NCM device Ethernet address");
++static char *host_addr;
++module_param(host_addr, charp, S_IRUGO);
++MODULE_PARM_DESC(host_addr, "NCM host Ethernet address");
+ static int add_ncm(struct usb_configuration *c)
+ {
+ 	struct usb_function_instance *fi; struct usb_function *f; int ret;
+ 	if (!ncm_coexist || func_ncm) return 0;
+ 	fi=usb_get_function_instance("ncm");
+ 	if (IS_ERR(fi)) { dev_err(&c->cdev->gadget->dev,"ncm: instance unavailable: %ld\n",PTR_ERR(fi)); return 0; }
++	/* Before usb_get_function(): it copies host_addr into the iMACAddress string. */
++	{
++		struct net_device *net=container_of(fi,struct f_ncm_opts,func_inst)->net;
++		if (dev_addr && gether_set_dev_addr(net,dev_addr)) dev_err(&c->cdev->gadget->dev,"ncm: invalid dev_addr %s\n",dev_addr);
++		if (host_addr && gether_set_host_addr(net,host_addr)) dev_err(&c->cdev->gadget->dev,"ncm: invalid host_addr %s\n",host_addr);
++	}
+ 	f=usb_get_function(fi);
+ 	if (IS_ERR(f)) { usb_put_function_instance(fi); return 0; }
+ 	ret=usb_add_function(c,f);

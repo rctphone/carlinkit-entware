@@ -1,0 +1,9 @@
+{
+  "carlinkit_repository": "ludwig-v/wireless-carplay-dongle-reverse-engineering",
+  "carlinkit_commit": "b437135316275a5d3c375bdd1ceac2a6bcf1315b",
+  "carlinkit_kernel_sums_path": "Kernel/SHA256SUMS",
+  "carlinkit_kernel_sums_sha256": "aaec4f944ad7ef9e12879b42dd6de4ad2edeee1a570439a2a5302781a5a3c940",
+  "kernel_version": "6.18.37",
+  "kernel_repository": "nxp-imx/linux-imx",
+  "kernel_commit": "6e694eda40aabd6671fca82b5416dbd76beeebb9"
+}
