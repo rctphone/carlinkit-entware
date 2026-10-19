@@ -31,3 +31,20 @@
  err_func_lb2:
  	if (!IS_ERR_OR_NULL(func_acm)) { usb_remove_function(&ptp_amd_aue_driver,func_acm); usb_put_function(func_acm); usb_put_function_instance(func_inst_acm); func_acm=NULL; func_inst_acm=NULL; }
  	if (!IS_ERR_OR_NULL(func_ncm)) { usb_remove_function(&ptp_driver,func_ncm); usb_put_function(func_ncm); usb_put_function_instance(func_inst_ncm); func_ncm=NULL; func_inst_ncm=NULL; }
+--- a/drivers/usb/chipidea/otg_fsm.h
++++ b/drivers/usb/chipidea/otg_fsm.h
+@@ -53,7 +53,13 @@
+ 					 * section:5.1.6
+ 					 */
+ /* A-SE0 to B-Reset  */
+-#define TB_ASE0_BRST         (155)	/* minimum 155 ms, section:5.3.1 */
++/*
++ * U2W: on this dongle b_wait_acon is entered only by Apple's USB role switch (request 0x51
++ * to the fake-iPhone gadget).  The head unit then turns its own port into a device: a VW
++ * MIB2G took 590 ms to enumerate (2026-10-19), so the OTG minimum of 155 ms timed out and
++ * the switch looped every ~2 s.  The spec value is a minimum; wait up to 3 s.
++ */
++#define TB_ASE0_BRST         (3000)	/* minimum 155 ms, section:5.3.1 */
+ /* SE0 Time Before SRP */
+ #define TB_SE0_SRP           (1000)	/* b_idle,minimum 1s, section:5.1.2 */
+ /* SSEND time before SRP */
