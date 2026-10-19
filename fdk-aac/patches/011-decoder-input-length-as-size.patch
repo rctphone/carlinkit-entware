@@ -1,0 +1,76 @@
+From: U2W build
+Subject: [PATCH] aacdec: keep the output-buffer check; an input byte count passed as size means "unknown"
+
+0.1.5 added
+  if (timeDataSize_extern < numChannels*frameSize) ErrorStatus = AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
+0.1.4, the vendor library AppleCarPlay was built against (byte-identical in every Carlinkit
+firmware 2023-2025), ignored timeDataSize and decoded the frame in place.
+
+Measured in the car (2026-10-19, VW MIB2G, instrumented build): on its AAC-ELD call-audio path
+(AOT 39, 16 kHz, mono, frame 480) AppleCarPlay passes as timeDataSize the input byte count it
+just handed to aacDecoder_Fill (2, 25, 45, 74, 117, 148..181: the packet lengths).  0.1.6
+rejected every frame with 0x200c and calls were silent in the car.  The CarPlay SDK's AAC-ELD
+converter only decodes into a buffer of at least kAudioSamplesPerPacket_AAC_ELD (480) frames.
+
+aacDecoder_Fill records the input byte count per decoder handle.  When timeDataSize equals it,
+the caller passed its input length, not an output size: write the frame as 0.1.4 did
+(numChannels*frameSize samples, the vendor footprint) and log it once per handle.  Every other
+value keeps the 0.1.6 check, so a real undersized buffer is still rejected.
+
+--- a/libAACdec/src/aacdecoder_lib.cpp
++++ b/libAACdec/src/aacdecoder_lib.cpp
+@@ -658,6 +658,8 @@
+     goto bail;
+   }
+   aacDec->hInput = pIn;
++  aacDec->u2wLastFillBytes = -1;
++  aacDec->u2wFillSizeLogged = 0;
+ 
+   aacDec->nrOfLayers = nrOfLayers;
+ 
+@@ -718,6 +720,9 @@
+   INT layer      = 0;
+   INT nrOfLayers = self->nrOfLayers;
+ 
++  /* U2W: remember the input byte count; see the output-buffer check in aacDecoder_DecodeFrame. */
++  self->u2wLastFillBytes = (nrOfLayers > 0) ? (INT)bufferSize[0] : -1;
++
+   {
+     for (layer = 0; layer < nrOfLayers; layer++){
+       {
+@@ -1052,8 +1057,22 @@
+     /* Update Statistics */
+     aacDecoder_UpdateBitStreamCounters(&self->streamInfo, hBs, nBits, ErrorStatus);
+ 
+-    /* Check whether external output buffer is large enough. */
+-    if (timeDataSize_extern < self->streamInfo.numChannels*self->streamInfo.frameSize) {
++    /* Check whether external output buffer is large enough.
++       U2W: AppleCarPlay's AAC-ELD (call audio) path passes the input byte count it just gave
++       aacDecoder_Fill as timeDataSize (measured in the car 2026-10-19: 2..181, always the
++       packet length, frame 1*480).  That is no output size; fdk-aac 0.1.4, the vendor library,
++       ignored the argument and wrote the frame, and the CarPlay SDK only decodes AAC-ELD into
++       a buffer of at least kAudioSamplesPerPacket_AAC_ELD frames.  Treat exactly that value as
++       "size unknown" and write the frame as 0.1.4 did; every other value is checked. */
++    if (timeDataSize_extern == self->u2wLastFillBytes) {
++      if (!self->u2wFillSizeLogged) {
++        self->u2wFillSizeLogged = 1;
++        FDKprintfErr("fdk-aac: timeDataSize %d is the input byte count, not an output size; "
++                     "writing one frame (%d samples) as fdk-aac 0.1.4 did\n", timeDataSize_extern,
++                     self->streamInfo.numChannels*self->streamInfo.frameSize);
++      }
++    }
++    else if (timeDataSize_extern < self->streamInfo.numChannels*self->streamInfo.frameSize) {
+       ErrorStatus = AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
+     }
+ 
+--- a/libAACdec/src/aacdecoder.h
++++ b/libAACdec/src/aacdecoder.h
+@@ -227,6 +227,8 @@
+   UINT         extGainDelay;                         /*!< Delay that must be accounted for extGain. */
+ 
+   INT_PCM      pcmOutputBuffer[(8)*(2048)];
++  INT          u2wLastFillBytes;   /* U2W: input bytes of the last aacDecoder_Fill (-1: none) */
++  INT          u2wFillSizeLogged;
+ 
+ };
+ 
